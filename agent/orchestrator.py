@@ -1,37 +1,50 @@
 """
 SAM Agent Orchestrator
 
-Entry point for the agent control flow. Orchestrates the interaction between
-graph execution, state management, memory, and services.
+Main entry point for the agent control flow. This module is the public API
+for invoking the agent.
 
-This module is responsible for:
-- Initializing the agent with configuration
-- Executing the agent graph for each invocation
-- Coordinating between components (state, memory, tools, services)
-- Handling invocation lifecycle (input -> output)
+The actual graph implementation is in langgraph_orchestrator.py, which
+implements the exact structure defined in design/langgraph_skeleton.md.
 """
+
+from typing import Optional, Dict, Any
+from agent.langgraph_orchestrator import SAMAgentOrchestrator
+from inference import ModelBackend, StubModelBackend
 
 
 class SAMOrchestrator:
     """
     Main orchestrator for the SAM agent.
     
-    Coordinates the flow of execution through the agent graph,
-    managing state, memory, and service invocations.
+    Public API for agent invocation. Delegates to LangGraph implementation.
     """
     
-    def __init__(self):
-        """Initialize the agent orchestrator."""
-        pass
+    def __init__(self, model_backend: Optional[ModelBackend] = None):
+        """
+        Initialize the agent orchestrator.
+        
+        Args:
+            model_backend: ModelBackend instance (StubModelBackend by default for testing)
+        """
+        self.langgraph_orchestrator = SAMAgentOrchestrator(
+            model_backend=model_backend or StubModelBackend()
+        )
     
-    async def invoke(self, input_data):
+    async def invoke(self, raw_input: str, conversation_id: Optional[str] = None, trace_id: Optional[str] = None) -> Dict[str, Any]:
         """
         Execute a single agent invocation.
         
         Args:
-            input_data: Input to process
+            raw_input: Raw input to process (text, audio reference, or image reference)
+            conversation_id: Optional conversation ID (generated if not provided)
+            trace_id: Optional trace ID (generated if not provided)
             
         Returns:
-            Agent output/response
+            Response dict with conversation_id, trace_id, status, output, error_type, metadata
         """
-        pass
+        return await self.langgraph_orchestrator.invoke(
+            raw_input=raw_input,
+            conversation_id=conversation_id,
+            trace_id=trace_id,
+        )
