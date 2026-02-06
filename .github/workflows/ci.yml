@@ -1,0 +1,70 @@
+name: CI
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main, develop ]
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+      - name: Lint
+        run: |
+          # Add linting commands here
+          echo "Linting..."
+
+  unit-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+      - name: Run unit tests
+        run: |
+          # Add unit test commands here
+          echo "Running unit tests..."
+
+  integration-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+      - name: Run integration tests
+        run: |
+          # Add integration test commands here
+          echo "Running integration tests..."
+
+  contract-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+      - name: Run contract tests
+        run: |
+          # Add contract test commands here
+          echo "Running contract tests..."
+
+  build:
+    runs-on: ubuntu-latest
+    needs: [ lint, unit-tests, integration-tests, contract-tests ]
+    steps:
+      - uses: actions/checkout@v3
+      - name: Build Docker image
+        run: |
+          # Add build commands here
+          echo "Building Docker image..."
