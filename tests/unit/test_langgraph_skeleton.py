@@ -70,13 +70,14 @@ def test_stub_backend_fail_task():
 
 def test_router_node():
     """Verify router_node classifies input modality."""
+    from uuid import uuid4
     orchestrator = SAMAgentOrchestrator()
     
     state = AgentState(
         conversation_id="test-conv",
-        trace_id="test-trace",
-        created_at="",
-        input_type="",
+        trace_id=str(uuid4()),
+        created_at="2026-02-06T10:00:00Z",
+        input_type="text",
         raw_input="Hello, world!",
     )
     
@@ -86,12 +87,13 @@ def test_router_node():
 
 def test_state_init_node():
     """Verify state_init_node generates IDs and timestamps."""
+    from uuid import uuid4
     orchestrator = SAMAgentOrchestrator()
     
     state = AgentState(
-        conversation_id="",
-        trace_id="",
-        created_at="",
+        conversation_id="test-conv",
+        trace_id=str(uuid4()),
+        created_at="2026-02-06T10:00:00Z",
         input_type="text",
         raw_input="test",
     )
