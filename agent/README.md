@@ -74,10 +74,11 @@ __end__
 1. Task nodes execute without decision logic
 2. `decision_logic_node` makes ALL routing decisions
 3. Model is called only through `ModelBackend` boundary
-4. Memory is NOT accessed yet
-5. All failures are explicit and typed
-6. State is mutated only in agent core nodes
-7. No retries, heuristics, or prompt engineering
+4. Memory is accessed ONLY via MemoryNodeManager (when authorized by decision_logic_node)
+5. **Observability is strictly passive** (never influences execution, decisions, or state)
+6. All failures are explicit and typed
+7. State is mutated only in agent core nodes
+8. No retries, heuristics, or prompt engineering
 
 If any rule is broken → architecture collapses.
 
@@ -107,8 +108,67 @@ class AgentState:
     error_type: Optional[str] = None
     
     # Control
-    command: Optional[str] = None  # preprocess | call_model | format
+    command: Optional[str] = None  # preprocess | call_model | format | memory_read | memory_write | long_term_memory_read | long_term_memory_write
+    
+    # Short-term memory (Phase 2)
+    memory_available: bool = True
+    memory_read_authorized: bool = False
+    memory_write_authorized: bool = False
+    memory_read_result: Optional[Dict[str, Any]] = None
+    memory_write_status: Optional[str] = None
+    
+    # Long-term memory (Phase 3.2)
+    long_term_memory_requested: bool = False
+    long_term_memory_status: str = "available"
+    long_term_memory_read_result: Optional[Dict[str, Any]] = None
+    long_term_memory_write_status: Optional[str] = None
 ```
+
+## Memory Integration
+
+### Short-Term Memory (Phase 2)
+Session-scoped context store for conversation continuity. See `agent/memory/` for details.
+
+### Long-Term Memory (Phase 3.2)
+Advisory, append-only store of stable facts with semantic search. Used for personalization without influencing routing.
+
+**Key Invariant**: Long-term memory is never authoritative. It informs responses but never changes:
+- Routing decisions
+- Control flow
+- What to do next
+- Authorization levels
+
+If long-term memory is removed, agent correctness is unchanged—only response personalization degrades.
+
+## Observability Integration (Phase 4)
+
+### Tracing (Tool-Agnostic)
+Implements passive observability via `agent/tracing/` module.
+
+**Key Guarantee**: Removing all tracing leaves agent behavior unchanged. Only visibility is lost.
+
+Features:
+- **Tracer ABC**: Tool-agnostic interface (no vendor lock-in)
+- **LangTraceTracer**: LangSmith backend (gracefully degrades if unavailable)
+- **InvariantAlarmSystem**: Detects constraint violations (smoke detectors, not sprinklers)
+- **Data Safety**: DENY list enforces that prompts, outputs, secrets never logged
+
+See [agent/tracing/README.md](tracing/README.md) for full documentation.
+
+**Design Frozen**: [design/observability_invariants.md](../design/observability_invariants.md)
+
+### Integration Points
+- Node entry/exit spans (in `langgraph_orchestrator.py`)
+- Trace identity propagation (trace_id, conversation_id, user_id)
+- Invariant violation alarms (non-blocking)
+- Silent failure on backend down (never blocks agent execution)
+
+### Non-Negotiable Constraints
+1. Tracing never affects control flow
+2. Tracing failures are silent and non-fatal
+3. Forbidden data (prompts, outputs, secrets) never traced
+4. Alarms emit but never block or decide
+5. Agent behavior identical with tracing ON/OFF
 
 ## Testing
 

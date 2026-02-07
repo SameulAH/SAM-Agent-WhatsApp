@@ -11,13 +11,15 @@ Task nodes execute without branching.
 from typing import Any, Dict, Optional
 from datetime import datetime
 from uuid import uuid4
+import time
 
 from langgraph.graph import StateGraph
 
 from inference import ModelBackend, ModelRequest, StubModelBackend
 from agent.state_schema import AgentState
-from agent.memory import MemoryController, StubMemoryController
+from agent.memory import MemoryController, StubMemoryController, LongTermMemoryStore, StubLongTermMemoryStore
 from agent.memory_nodes import MemoryNodeManager
+from agent.tracing import Tracer, TraceMetadata, NoOpTracer
 
 
 class SAMAgentOrchestrator:
@@ -34,17 +36,27 @@ class SAMAgentOrchestrator:
     - All failures are explicit and typed
     """
 
-    def __init__(self, model_backend: Optional[ModelBackend] = None, memory_controller: Optional[MemoryController] = None):
+    def __init__(
+        self,
+        model_backend: Optional[ModelBackend] = None,
+        memory_controller: Optional[MemoryController] = None,
+        long_term_memory_store: Optional[LongTermMemoryStore] = None,
+        tracer: Optional[Tracer] = None,
+    ):
         """
-        Initialize orchestrator with a model backend and memory controller.
+        Initialize orchestrator with a model backend and memory controllers.
         
         Args:
             model_backend: ModelBackend instance (StubModelBackend by default)
             memory_controller: MemoryController instance (StubMemoryController by default)
+            long_term_memory_store: LongTermMemoryStore instance (StubLongTermMemoryStore by default)
+            tracer: Tracer instance for observability (NoOpTracer by default)
         """
         self.model_backend = model_backend or StubModelBackend()
         self.memory_controller = memory_controller or StubMemoryController()
-        self.memory_nodes = MemoryNodeManager(self.memory_controller)
+        self.long_term_memory_store = long_term_memory_store or StubLongTermMemoryStore()
+        self.tracer = tracer or NoOpTracer()
+        self.memory_nodes = MemoryNodeManager(self.memory_controller, self.long_term_memory_store)
         self.graph = self._build_graph()
 
     def _build_graph(self) -> CompiledGraph:
@@ -58,15 +70,17 @@ class SAMAgentOrchestrator:
         """
         graph = StateGraph(AgentState)
 
-        # Add all nodes
+        # Add all nodes (wrapped with tracing via _wrap_node_call)
         graph.add_node("router_node", self._router_node)
         graph.add_node("state_init_node", self._state_init_node)
         graph.add_node("decision_logic_node", self._decision_logic_node)
         graph.add_node("task_preprocessing_node", self._task_preprocessing_node)
-        graph.add_node("memory_read_node", self.memory_nodes.memory_read_node)  # Phase 2
+        graph.add_node("memory_read_node", self._memory_read_node_wrapper)  # Phase 2
         graph.add_node("model_call_node", self._model_call_node)
         graph.add_node("result_handling_node", self._result_handling_node)
-        graph.add_node("memory_write_node", self.memory_nodes.memory_write_node)  # Phase 2
+        graph.add_node("memory_write_node", self._memory_write_node_wrapper)  # Phase 2
+        graph.add_node("long_term_memory_read_node", self._long_term_memory_read_node_wrapper)  # Phase 3.2
+        graph.add_node("long_term_memory_write_node", self._long_term_memory_write_node_wrapper)  # Phase 3.2
         graph.add_node("error_router_node", self._error_router_node)
         graph.add_node("format_response_node", self._format_response_node)
 
@@ -84,14 +98,17 @@ class SAMAgentOrchestrator:
             {
                 "preprocess": "task_preprocessing_node",
                 "memory_read": "memory_read_node",
+                "long_term_memory_read": "long_term_memory_read_node",  # Phase 3.2
                 "call_model": "model_call_node",
                 "memory_write": "memory_write_node",
+                "long_term_memory_write": "long_term_memory_write_node",  # Phase 3.2
                 "format": "format_response_node",
             }
         )
 
         graph.add_edge("task_preprocessing_node", "decision_logic_node")
         graph.add_edge("memory_read_node", "decision_logic_node")
+        graph.add_edge("long_term_memory_read_node", "decision_logic_node")  # Phase 3.2
         
         # model_call_node branches on success/failure
         graph.add_conditional_edges(
@@ -105,6 +122,7 @@ class SAMAgentOrchestrator:
 
         graph.add_edge("result_handling_node", "decision_logic_node")
         graph.add_edge("memory_write_node", "decision_logic_node")
+        graph.add_edge("long_term_memory_write_node", "decision_logic_node")  # Phase 3.2
         
         # error_router routes to format
         graph.add_edge("error_router_node", "format_response_node")
@@ -120,10 +138,14 @@ class SAMAgentOrchestrator:
             return "preprocess"
         elif state.command == "memory_read":
             return "memory_read"
+        elif state.command == "long_term_memory_read":  # Phase 3.2
+            return "long_term_memory_read"
         elif state.command == "call_model":
             return "call_model"
         elif state.command == "memory_write":
             return "memory_write"
+        elif state.command == "long_term_memory_write":  # Phase 3.2
+            return "long_term_memory_write"
         else:
             return "format"
 
@@ -133,6 +155,71 @@ class SAMAgentOrchestrator:
             return "success"
         else:
             return "failure"
+
+    def _create_trace_metadata(self, state: AgentState) -> TraceMetadata:
+        """Extract trace metadata from state."""
+        return TraceMetadata(
+            trace_id=state.trace_id,
+            conversation_id=state.conversation_id,
+            user_id=None,  # Not yet in schema, reserved for future
+        )
+
+    def _wrap_node_execution(self, node_name: str, node_fn, state: AgentState) -> Dict[str, Any]:
+        """
+        Wrap a node execution with tracing.
+        
+        Spans at node entry/exit for observability.
+        Tracing failures are silent and non-blocking.
+        """
+        trace_metadata = self._create_trace_metadata(state)
+        span = None
+        start_time = time.time()
+
+        # Node entry span
+        try:
+            span = self.tracer.start_span(
+                name=node_name,
+                metadata={"node_name": node_name},
+                trace_metadata=trace_metadata,
+            )
+        except Exception:
+            # Tracing failure is non-fatal
+            pass
+
+        try:
+            # Execute node
+            result = node_fn(state)
+            duration_ms = (time.time() - start_time) * 1000
+
+            # Node exit span
+            try:
+                self.tracer.end_span(
+                    span=span,
+                    status="success",
+                    metadata={"duration_ms": duration_ms},
+                )
+            except Exception:
+                # Tracing failure is non-fatal
+                pass
+
+            return result
+        except Exception as e:
+            # Exception handling (node failure)
+            duration_ms = (time.time() - start_time) * 1000
+
+            # Record failure span
+            try:
+                self.tracer.end_span(
+                    span=span,
+                    status="error",
+                    metadata={"duration_ms": duration_ms, "error": type(e).__name__},
+                )
+            except Exception:
+                # Tracing failure is non-fatal
+                pass
+
+            # Re-raise the exception (node failure propagates)
+            raise
 
     # ─────────────────────────────────────────────────────
     # NODE IMPLEMENTATIONS
@@ -149,6 +236,10 @@ class SAMAgentOrchestrator:
         - Must NOT read/write memory
         - Must NOT decide next step (that's decision_logic_node's job)
         """
+        return self._wrap_node_execution("router_node", self._router_node_impl, state)
+
+    def _router_node_impl(self, state: AgentState) -> Dict[str, Any]:
+        """Router node implementation (unwrapped)."""
         # Classify input type based on raw_input
         # For skeleton: assume text by default
         # TODO: Implement audio/image detection in future
@@ -169,6 +260,10 @@ class SAMAgentOrchestrator:
         - Must NOT call model
         - Must NOT access memory
         """
+        return self._wrap_node_execution("state_init_node", self._state_init_node_impl, state)
+
+    def _state_init_node_impl(self, state: AgentState) -> Dict[str, Any]:
+        """State init node implementation (unwrapped)."""
         # Generate IDs if not present
         conversation_id = state.conversation_id or str(uuid4())
         trace_id = state.trace_id or str(uuid4())
@@ -198,6 +293,8 @@ class SAMAgentOrchestrator:
         - Must NOT execute tasks
         - Must NOT call model
         - Must NOT mutate state directly (only set command)
+        
+        Note: Tracing NOT wrapped here (decision logic is not observed externally).
         """
         # Decision logic: pure control flow
         if state.preprocessing_result is None:
@@ -234,6 +331,10 @@ class SAMAgentOrchestrator:
         - Must NOT write memory
         - Must NOT handle errors globally
         """
+        return self._wrap_node_execution("task_preprocessing_node", self._task_preprocessing_node_impl, state)
+
+    def _task_preprocessing_node_impl(self, state: AgentState) -> Dict[str, Any]:
+        """Preprocessing node implementation (unwrapped)."""
         if state.input_type == "text":
             # Text preprocessing: simple normalization
             preprocessing_result = state.raw_input.strip()
@@ -263,6 +364,10 @@ class SAMAgentOrchestrator:
         - Must NOT decide routing (transitions are explicit)
         - Must NOT mutate state beyond model_response
         """
+        return self._wrap_node_execution("model_call_node", self._model_call_node_impl, state)
+
+    def _model_call_node_impl(self, state: AgentState) -> Dict[str, Any]:
+        """Model call node implementation (unwrapped)."""
         # Build request
         request = ModelRequest(
             task="respond",
@@ -272,8 +377,39 @@ class SAMAgentOrchestrator:
             trace_id=state.trace_id,
         )
 
+        trace_metadata = self._create_trace_metadata(state)
+        start_time = time.time()
+
+        # Model call span (metadata only, no prompts/outputs)
+        try:
+            self.tracer.record_event(
+                name="model_call_attempted",
+                metadata={"model_requested": True},
+                trace_metadata=trace_metadata,
+            )
+        except Exception:
+            # Tracing failure is non-fatal
+            pass
+
         # Call model backend
         model_response = self.model_backend.generate(request)
+
+        # Record model call result (metadata only)
+        duration_ms = (time.time() - start_time) * 1000
+        try:
+            success_status = "success" if model_response.status == "success" else "failure"
+            self.tracer.record_event(
+                name="model_call_completed",
+                metadata={
+                    "status": success_status,
+                    "duration_ms": duration_ms,
+                    "error_type": model_response.error_type if model_response.status != "success" else None,
+                },
+                trace_metadata=trace_metadata,
+            )
+        except Exception:
+            # Tracing failure is non-fatal
+            pass
 
         return {
             "model_response": model_response,
@@ -291,6 +427,10 @@ class SAMAgentOrchestrator:
         - Must NOT access memory implicitly
         - Model outputs are data, not control signals
         """
+        return self._wrap_node_execution("result_handling_node", self._result_handling_node_impl, state)
+
+    def _result_handling_node_impl(self, state: AgentState) -> Dict[str, Any]:
+        """Result handling node implementation (unwrapped)."""
         if not state.model_response:
             raise ValueError("model_response is None in result_handling_node")
 
@@ -314,6 +454,10 @@ class SAMAgentOrchestrator:
         - Must NOT retry silently
         - Must NOT mutate unrelated state
         """
+        return self._wrap_node_execution("error_router_node", self._error_router_node_impl, state)
+
+    def _error_router_node_impl(self, state: AgentState) -> Dict[str, Any]:
+        """Error router node implementation (unwrapped)."""
         if not state.model_response:
             error_type = "unknown"
             fallback_output = "[Error: No model response]"
@@ -337,6 +481,10 @@ class SAMAgentOrchestrator:
         - Must NOT call model
         - Must NOT write memory
         """
+        return self._wrap_node_execution("format_response_node", self._format_response_node_impl, state)
+
+    def _format_response_node_impl(self, state: AgentState) -> Dict[str, Any]:
+        """Format response node implementation (unwrapped)."""
         response = {
             "conversation_id": state.conversation_id,
             "trace_id": state.trace_id,
@@ -347,6 +495,78 @@ class SAMAgentOrchestrator:
         }
 
         return response
+
+    # ─────────────────────────────────────────────────────
+    # MEMORY NODE WRAPPERS (WITH TRACING)
+    # ─────────────────────────────────────────────────────
+
+    def _memory_read_node_wrapper(self, state: AgentState) -> Dict[str, Any]:
+        """Wrap memory_read_node with tracing."""
+        trace_metadata = self._create_trace_metadata(state)
+        
+        # Record memory read attempt
+        try:
+            self.tracer.record_event(
+                name="memory_read_attempted",
+                metadata={"authorized": state.memory_read_authorized},
+                trace_metadata=trace_metadata,
+            )
+        except Exception:
+            # Tracing failure is non-fatal
+            pass
+
+        return self._wrap_node_execution("memory_read_node", self.memory_nodes.memory_read_node, state)
+
+    def _memory_write_node_wrapper(self, state: AgentState) -> Dict[str, Any]:
+        """Wrap memory_write_node with tracing."""
+        trace_metadata = self._create_trace_metadata(state)
+        
+        # Record memory write attempt
+        try:
+            self.tracer.record_event(
+                name="memory_write_attempted",
+                metadata={"authorized": state.memory_write_authorized},
+                trace_metadata=trace_metadata,
+            )
+        except Exception:
+            # Tracing failure is non-fatal
+            pass
+
+        return self._wrap_node_execution("memory_write_node", self.memory_nodes.memory_write_node, state)
+
+    def _long_term_memory_read_node_wrapper(self, state: AgentState) -> Dict[str, Any]:
+        """Wrap long_term_memory_read_node with tracing (Phase 3.2)."""
+        trace_metadata = self._create_trace_metadata(state)
+        
+        # Record long-term memory read attempt
+        try:
+            self.tracer.record_event(
+                name="long_term_memory_read_attempted",
+                metadata={"requested": state.long_term_memory_requested},
+                trace_metadata=trace_metadata,
+            )
+        except Exception:
+            # Tracing failure is non-fatal
+            pass
+
+        return self._wrap_node_execution("long_term_memory_read_node", self.memory_nodes.long_term_memory_read_node, state)
+
+    def _long_term_memory_write_node_wrapper(self, state: AgentState) -> Dict[str, Any]:
+        """Wrap long_term_memory_write_node with tracing (Phase 3.2)."""
+        trace_metadata = self._create_trace_metadata(state)
+        
+        # Record long-term memory write attempt
+        try:
+            self.tracer.record_event(
+                name="long_term_memory_write_attempted",
+                metadata={"requested": state.long_term_memory_requested},
+                trace_metadata=trace_metadata,
+            )
+        except Exception:
+            # Tracing failure is non-fatal
+            pass
+
+        return self._wrap_node_execution("long_term_memory_write_node", self.memory_nodes.long_term_memory_write_node, state)
 
     # ─────────────────────────────────────────────────────
     # HELPERS (for testing and internal use)

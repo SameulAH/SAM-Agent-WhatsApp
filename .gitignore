@@ -133,3 +133,5 @@ dmypy.json
 # Temporary files
 *.tmp
 *.bak
+# Markdown files
+*.md

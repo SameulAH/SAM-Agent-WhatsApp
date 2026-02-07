@@ -1,0 +1,129 @@
+# Phase 5.3.3: First Controlled Intelligence Experiment
+# Experiment: EXP-001-minimal-prompt-clarity
+# Purpose: Infrastructure validation (NOT optimization)
+# Status: GOVERNED - follows Phase 5.3.1 protocol
+
+experiment_id: "EXP-001-minimal-prompt-clarity"
+
+hypothesis: |
+  A minor clarity-oriented prompt adjustment will reduce correction pressure 
+  (correction_rate, retry_rate) without negatively affecting latency, 
+  hallucination risk, or task completion.
+
+changed_variable: "prompt_clarity_sentence"
+
+baseline_id: "v1"
+
+variant_id: "prompt-clarity-v2"
+
+metrics_used:
+  # Primary metrics (allowed to improve)
+  - correction_rate
+  - retry_rate
+  - turns_to_completion
+  
+  # Guardrail metrics (must NOT regress)
+  - hallucination_proxy_rate
+  - self_correction_frequency
+  - latency_per_completed_task
+  - task_completion_rate
+  
+  # Memory usefulness metrics (must remain statistically identical)
+  - memory_reference_rate
+  - memory_improvement_rate
+
+minimum_runs: 5
+
+created_at: "2026-02-07T00:00:00Z"
+
+author: "SAM Infrastructure Team"
+
+# ─────────────────────────────────────────────────
+# CHANGE SPECIFICATION (SINGLE VARIABLE ONLY)
+# ─────────────────────────────────────────────────
+
+# BASELINE PROMPT (unchanged)
+baseline_prompt: |
+  [Current accepted system prompt P₀]
+  [This is unchanged throughout the experiment]
+
+# VARIANT PROMPT (P₁ = P₀ + ONE sentence)
+variant_prompt_change: |
+  At the END of the current system prompt, add exactly this sentence:
+  
+  "Respond concisely and directly. Avoid unnecessary verbosity."
+  
+  NOTHING else may change:
+  ✅ Only append the sentence
+  ❌ No formatting changes
+  ❌ No examples added
+  ❌ No role instructions modified
+  ❌ No system message restructuring
+  ❌ No decoding parameter changes
+
+# ─────────────────────────────────────────────────
+# EXECUTION PARAMETERS
+# ─────────────────────────────────────────────────
+
+# Dataset
+dataset: "EXP-001-fixed-dataset.json"
+dataset_description: "Fixed, frozen dataset of ≥30 conversations (identical for baseline and variant)"
+dataset_hash: "will-be-computed-at-runtime"
+
+# Randomness control
+random_seed: 42
+deterministic: true
+
+# Trace collection
+collect_traces: true
+trace_backend: "Phase 4.2"
+
+# ─────────────────────────────────────────────────
+# AUTOMATIC REJECTION CONDITIONS
+# ─────────────────────────────────────────────────
+# Experiment outcome is REJECT if ANY occur:
+
+rejection_criteria:
+  - hallucination_proxy_rate increases beyond baseline variance
+  - latency_per_completed_task increases without quality improvement
+  - task_completion_rate drops
+  - invariant alarms appear
+  - control_flow divergence detected (even once)
+  - any_safety_constraint violated
+
+# ─────────────────────────────────────────────────
+# PROTOCOL COMPLIANCE
+# ─────────────────────────────────────────────────
+
+# Phase 5.3.1 Protocol
+protocol_version: "5.3.1"
+protocol_enforced: true
+single_variable_validated: false  # Will be set to true after spec validation
+metrics_from_phase_5_2: true
+minimum_runs_met: true
+
+# Phase 5.3.2 Harness
+harness_version: "5.3.2"
+harness_required_pipeline:
+  - "Load experiment spec"
+  - "Validate spec (Phase 5.3.1)"
+  - "Execute baseline run (N=5)"
+  - "Execute variant run (N=5)"
+  - "Capture Phase 4.2 traces"
+  - "Compute Phase 5.2 metrics"
+  - "Compare baseline vs variant"
+  - "Generate report"
+  - "Record reproducibility metadata"
+
+# ─────────────────────────────────────────────────
+# BASELINE IMMUTABILITY GUARANTEE
+# ─────────────────────────────────────────────────
+baseline_immutable: true
+baseline_never_modified: true
+baseline_remains_authoritative: true
+
+notes: |
+  This experiment is about validating the experimentation platform, not 
+  optimizing intelligence. A clean rejection is a successful infrastructure outcome.
+  
+  All decisions must be evidence-based (Phase 5.2 metrics), with no subjective override.

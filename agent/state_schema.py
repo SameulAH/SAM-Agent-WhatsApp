@@ -25,6 +25,7 @@ class AgentState:
     - command is the only control flow signal (decision_logic_node writes it)
     - error_type is set only by error_router_node
     - memory fields store pointers and metadata, never actual knowledge
+    - long_term_memory_* fields are advisory only, never influence routing
     """
 
     # Identity
@@ -50,13 +51,20 @@ class AgentState:
     # Control
     command: Optional[str] = None  # preprocess | call_model | success | failure
     
-    # Memory: Phase 2 Addition
+    # Memory: Phase 2 Addition (Short-term)
     # These fields store metadata and pointers, never actual memory content
     memory_available: bool = True                    # Is memory service available?
     memory_read_authorized: bool = False             # Does this execution want to read memory?
     memory_write_authorized: bool = False            # Does this execution want to write memory?
     memory_read_result: Optional[Dict[str, Any]] = None  # Data from memory read (if authorized)
     memory_write_status: Optional[str] = None        # Status of memory write operation
+
+    # Memory: Phase 3.2 Addition (Long-term)
+    # Long-term memory is advisory-only, never influences control flow
+    long_term_memory_requested: bool = False         # Should we access long-term memory?
+    long_term_memory_status: str = "available"       # "available" | "unavailable"
+    long_term_memory_read_result: Optional[Dict[str, Any]] = None  # Facts retrieved (if authorized)
+    long_term_memory_write_status: Optional[str] = None  # Status of long-term fact write
 
     def __post_init__(self):
         """Validate state schema."""

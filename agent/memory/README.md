@@ -59,19 +59,122 @@ write_request = MemoryWriteRequest(
 response = memory.write(write_request)
 ```
 
-### Phase 3.2: Long-Term Memory (PLANNED)
+### Phase 3.2: Long-Term Memory (CLOSED)
 
-Qdrant-backed semantic knowledge base with embeddings, personalization, and cross-session learning.
+Long-term memory is an advisory, append-only store of stable facts with semantic search capabilities. It enables cross-session personalization without ever influencing control flow or decisions.
+
+**Long-term memory IS:**
+- User-scoped (spans multiple conversations)
+- Append-only (immutable history)
+- Advisory-only (never influences routing)
+- Semantically searchable (Qdrant-backed)
+- Non-blocking (failures don't prevent execution)
+- Authorization-based (decision_logic_node sole authorizer)
+
+**Long-term memory IS NOT:**
+- Updatable (facts can't be corrected retroactively)
+- Authoritative (never decides what to do)
+- Transactional (no rollbacks)
+- Mandatory (gracefully degrades if unavailable)
+- Emotional state (never stores urgency, emotions, or control directives)
+
+#### Implementation
+
+- **LongTermMemoryStore**: Abstract interface with write_fact() and retrieve_facts()
+- **StubLongTermMemoryStore**: In-memory append-only list for testing
+- **DisabledLongTermMemoryStore**: Disabled store for control-flow invariant testing
+- **QdrantLongTermMemoryStore**: Qdrant-backed semantic search (production)
+
+#### Data Model
+
+```python
+@dataclass
+class MemoryFact:
+    fact_type: str              # "preference", "pattern", "summary", etc.
+    content: Dict[str, Any]     # JSON-serializable fact
+    user_id: str                # Who owns this fact?
+    confidence: float = 1.0     # 0.0-1.0 confidence score
+    source: str = "conversation"  # Where did this fact come from?
+    fact_id: Optional[str] = None   # UUID (set by storage)
+    created_at: Optional[str] = None # ISO timestamp (set by storage)
+```
+
+#### Interface
+
+```python
+from agent.memory import (
+    LongTermMemoryStore,
+    StubLongTermMemoryStore,
+    MemoryFact,
+    LongTermMemoryWriteRequest,
+    LongTermMemoryRetrievalQuery,
+)
+
+# Create instance
+store = StubLongTermMemoryStore()
+
+# Write a fact (only when authorized)
+fact = MemoryFact(
+    fact_type="preference",
+    content={"preference": "concise responses"},
+    user_id="user123",
+    confidence=0.9,
+    source="agent_inferred",
+)
+write_request = LongTermMemoryWriteRequest(
+    user_id="user123",
+    fact=fact,
+    authorized=True,  # Set by decision_logic_node
+    reason="agent_storing_interaction_outcome",
+)
+response = store.write_fact(write_request)
+# Returns: LongTermMemoryWriteResponse with status and fact_id
+
+# Retrieve facts (only when authorized)
+query = LongTermMemoryRetrievalQuery(
+    user_id="user123",
+    fact_types=["preference"],  # Optional: filter by type
+    limit=10,  # Default limit
+    authorized=True,  # Set by decision_logic_node
+)
+response = store.retrieve_facts(query)
+# Returns: LongTermMemoryRetrievalResponse with facts (oldest first)
+```
+
+#### Key Invariants
+
+1. **Append-Only**: Facts are written once, never updated or deleted
+2. **Advisory-Only**: Retrieval never influences decisions or routing
+3. **Authorization-Based**: Only `decision_logic_node` can authorize reads/writes
+4. **Non-Fatal**: Failures return Response objects, never raise exceptions
+5. **User-Scoped**: Facts isolated per user_id
+6. **Deterministic Ordering**: Results ordered by created_at (oldest first)
+
+#### Testing
+
+Long-term memory is tested with 21 comprehensive tests covering:
+- Interface compatibility (Stub ↔ Qdrant swappable)
+- Append-only semantics (no overwrites, full history)
+- Authorization enforcement (unauthorized reads/writes rejected)
+- Control-flow invariance (routing identical with memory ON/OFF)
+- Failure safety (Qdrant unavailable, empty retrieval, etc.)
+
+See `tests/unit/test_long_term_memory.py` for full test suite.
 
 ## Architecture
 
-Memory is decoupled via `MemoryController` abstract interface:
+Memory is decoupled via abstract interfaces:
 
-- **MemoryController**: Abstract base class
-- **StubMemoryController**: In-memory for testing (Phase 2)
-- **DisabledMemoryController**: Disabled for testing invariants (Phase 2)
+**Short-Term Memory** (MemoryController):
+- **MemoryController**: Abstract base class for session-scoped context
+- **StubMemoryController**: In-memory for testing
 - **SQLiteShortTermMemoryStore**: Durable session context (Phase 3.1)
-- Future: **QdrantLongTermMemoryStore** (Phase 3.2)
+
+**Long-Term Memory** (LongTermMemoryStore):
+- **LongTermMemoryStore**: Abstract base class for cross-session facts
+- **StubLongTermMemoryStore**: In-memory append-only list for testing
+- **DisabledLongTermMemoryStore**: Disabled store for invariant testing
+- **QdrantLongTermMemoryStore**: Qdrant-backed semantic search (production)
 
 All implementations:
 - Return typed Response objects (never raise exceptions)

@@ -1,0 +1,178 @@
+# Experiment Specification Template
+
+**INSTRUCTIONS:**
+1. Fill in all fields below
+2. `changed_variable` MUST be singular (exactly one thing)
+3. `metrics_used` MUST be Phase 5.2 metrics (see list below)
+4. `hypothesis` MUST be falsifiable and specific
+5. Save as `exp-NNN-spec.yaml` and validate using `experiments/protocol/validator.py`
+
+---
+
+## METADATA
+
+```yaml
+experiment_id: "exp-NNN"         # e.g., exp-001
+author: "YOUR_NAME"              # Who is proposing this?
+created_at: "2026-02-07T00:00:00Z"  # ISO 8601 timestamp
+```
+
+---
+
+## PROPOSAL
+
+```yaml
+hypothesis: |
+  [FILL IN: What do you believe will happen? Must be falsifiable and specific.]
+  
+  Example:
+  "Refining the system prompt to include explicit step-by-step reasoning 
+   will improve task_completion_rate by at least 5% (0.85 → 0.90) while 
+   maintaining correction_rate below 10%."
+```
+
+```yaml
+changed_variable: |
+  [FILL IN: The SINGLE variable being changed. Must not contain 'and', 'or', commas.]
+  
+  ✅ Examples:
+  - "System prompt in task_preprocessing_node"
+  - "Model switch from GPT-4 to Claude-3"
+  - "Timeout reduction from 5s to 3s"
+  - "Memory retrieval threshold from 0.5 to 0.7"
+  
+  ❌ Non-examples (INVALID):
+  - "Improve prompt AND adjust timeout" (2 variables)
+  - "Better reasoning and faster responses" (2 variables)
+  - "Various optimizations" (vague, multiple changes)
+```
+
+---
+
+## BASELINE & VARIANT
+
+```yaml
+baseline_id: "v1"                # Reference to Phase 5.2 baseline (frozen)
+variant_id: "variant-NNN"        # Label for your variant
+                                 # e.g., prompt-v2, timeout-3s, claude3-test
+```
+
+---
+
+## METRICS & STATISTICAL REQUIREMENTS
+
+```yaml
+metrics_used:                     # Phase 5.2 metrics to evaluate
+  - task_completion_rate          # Choose relevant ones for your hypothesis
+  - correction_rate
+  - turns_to_completion
+
+minimum_runs: 30                  # Minimum traces per variant
+                                 # Recommendation: >= 30 (Phase 5.2 uses ~30 for stable stats)
+```
+
+### Valid Phase 5.2 Metrics
+
+**Task Completion Effectiveness:**
+- `task_completion_rate` — % sessions where task completed
+- `correction_rate` — % turns where user corrected
+- `follow_up_rate` — % turns with clarification questions
+- `turns_to_completion` — avg turns to completion
+
+**Correction & Retry Pressure:**
+- `retry_rate` — % turns with retries
+- `correction_feedback_rate` — % turns with explicit corrections
+- `recovery_turns` — avg turns to recover after failure
+- `backtracking_frequency` — how often user must re-explain context
+
+**Memory Usefulness (Advisory):**
+- `memory_reference_rate` — % turns using memory
+- `memory_improvement_rate` — % sessions improved by memory
+- `repetition_reduction_rate` — % unique information vs total
+
+**Hallucination Risk Signals:**
+- `hallucination_proxy_rate` — heuristic hallucination rate
+- `self_correction_frequency` — how often agent revises claims
+- `factual_consistency_rate` — % responses without errors
+- `confidence_accuracy_correlation` — when confident, how accurate?
+- `uncertainty_expression_rate` — % answers with confidence bounds
+
+**Latency-Quality Tradeoff:**
+- `response_time_ms` — median response time
+- `quality_adjusted_response_time` — quality per unit time
+- `premature_optimization_rate` — fast but incomplete responses
+- `over_elaboration_rate` — slow but no improvement in completion
+
+---
+
+## VALIDATION CHECKLIST
+
+Before submitting, verify:
+
+- [ ] `experiment_id` is unique (not duplicate)
+- [ ] `hypothesis` is falsifiable (not "should be fine" or "might work")
+- [ ] `changed_variable` contains NO "and", "or", commas (singular!)
+- [ ] `metrics_used` are ALL from Phase 5.2 list above
+- [ ] `minimum_runs` >= 30 (or justified if lower)
+- [ ] `author` is filled in
+- [ ] `created_at` is ISO 8601 timestamp
+
+---
+
+## EXAMPLE: VALID EXPERIMENT
+
+```yaml
+experiment_id: "exp-001"
+author: "Alice Engineer"
+created_at: "2026-02-07T10:30:00Z"
+
+hypothesis: |
+  Refining the system prompt to include explicit step-by-step reasoning 
+  will improve task_completion_rate from 0.85 to 0.90+ while keeping 
+  correction_rate at or below 5%.
+
+changed_variable: "System prompt in task_preprocessing_node"
+
+baseline_id: "v1"
+variant_id: "prompt-v2-reasoning"
+
+metrics_used:
+  - task_completion_rate
+  - correction_rate
+  - turns_to_completion
+  - response_time_ms
+
+minimum_runs: 30
+```
+
+---
+
+## NEXT STEPS
+
+1. **Save this file** as `exp-NNN-spec.yaml`
+2. **Validate** using:
+   ```python
+   from experiments.protocol.validator import validate_experiment_spec
+   from experiments.protocol.schema import ExperimentSpec
+   import yaml
+   
+   with open("exp-NNN-spec.yaml") as f:
+       data = yaml.safe_load(f)
+   
+   spec = ExperimentSpec(**data)
+   result = validate_experiment_spec(spec)
+   
+   if result.valid:
+       print("✅ Specification is VALID")
+   else:
+       print("❌ Validation errors:")
+       for error in result.errors:
+           print(f"  [{error.field}] {error.error}")
+   ```
+
+3. **Register** the experiment in `experiments/registry/experiments.json`
+4. **Submit** for review
+
+---
+
+**Remember:** Intelligence changes without protocol compliance are considered invalid by definition.
