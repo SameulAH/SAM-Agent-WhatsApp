@@ -1,0 +1,63 @@
+version: "3.9"
+
+services:
+  # Ollama LLM service
+  ollama:
+    image: ollama/ollama:latest
+    container_name: sam-agent-ollama
+    ports:
+      - "11434:11434"
+    environment:
+      - OLLAMA_KEEP_ALIVE=24h
+    volumes:
+      - ollama_data:/root/.ollama
+    networks:
+      - sam_network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:11434/api/tags"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    command: serve
+
+  # Whisper STT service (optional, for API-based usage)
+  # Note: Local Whisper (via Python package) runs in-process in the agent
+  # This is provided as an optional API service if needed
+
+  # Coqui TTS service (optional, for API-based usage)
+  # Note: Local Coqui (via Python package) runs in-process in the agent
+  # This is provided as an optional API service if needed
+
+  # Qdrant Vector Database for Long-Term Memory
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: sam-agent-qdrant
+    ports:
+      - "6333:6333"
+    environment:
+      - QDRANT_API_KEY=${QDRANT_API_KEY:-}
+    volumes:
+      - qdrant_data:/qdrant/storage
+    networks:
+      - sam_network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:6333/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  # SQLite Short-Term Memory (runs on persistent volume)
+  # Note: SQLite is not containerized; the agent accesses it via volume mount
+  # This service is a placeholder for documentation
+
+networks:
+  sam_network:
+    driver: bridge
+
+volumes:
+  ollama_data:
+    driver: local
+  qdrant_data:
+    driver: local

@@ -18,6 +18,7 @@ from agent.memory.types import (
 from agent.memory.long_term_base import LongTermMemoryStore
 from agent.memory.long_term_stub import StubLongTermMemoryStore, DisabledLongTermMemoryStore
 from agent.memory.long_term_qdrant import QdrantLongTermMemoryStore
+from agent.memory.cognee_adapter import CogneeMemoryAdapter
 from agent.memory.long_term_types import (
     MemoryFact,
     LongTermMemoryWriteRequest,
@@ -45,6 +46,7 @@ __all__ = [
     "StubLongTermMemoryStore",
     "DisabledLongTermMemoryStore",
     "QdrantLongTermMemoryStore",
+    "CogneeMemoryAdapter",
     "MemoryFact",
     "LongTermMemoryWriteRequest",
     "LongTermMemoryWriteResponse",
