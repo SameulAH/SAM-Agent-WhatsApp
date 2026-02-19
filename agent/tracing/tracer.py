@@ -12,7 +12,7 @@ Frozen by design/observability_invariants.md
 """
 
 from abc import ABC, abstractmethod
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, Callable
 from dataclasses import dataclass
 from datetime import datetime
 
@@ -36,6 +36,15 @@ class Tracer(ABC):
     - Non-fatal failures (never raise)
     - Best-effort execution
     """
+
+    def __init__(self, observability_sink: Optional[Callable] = None):
+        """
+        Initialize tracer with optional observability sink.
+        
+        Args:
+            observability_sink: Optional callback for recording trace events to observability store
+        """
+        self.observability_sink = observability_sink
 
     @abstractmethod
     def start_span(
@@ -115,6 +124,10 @@ class NoOpTracer(Tracer):
     Satisfies the Tracer interface but does nothing.
     Used when tracing is disabled or unavailable.
     """
+
+    def __init__(self, observability_sink: Optional[Callable] = None):
+        """Initialize no-op tracer."""
+        super().__init__(observability_sink)
 
     def start_span(
         self, name: str, metadata: Dict[str, Any], trace_metadata: TraceMetadata

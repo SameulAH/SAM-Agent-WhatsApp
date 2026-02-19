@@ -8,6 +8,7 @@ Phase 2: Short-term memory (MemoryController)
 Phase 3.2: Long-term memory (LongTermMemoryStore)
 """
 
+import logging
 from typing import Dict, Any, Optional
 
 from agent.state_schema import AgentState
@@ -22,6 +23,9 @@ from agent.memory import (
     LongTermMemoryWriteRequest,
     LongTermMemoryRetrievalQuery,
 )
+
+# Get logger for memory operations
+logger = logging.getLogger(__name__)
 
 
 class MemoryNodeManager:
@@ -128,8 +132,17 @@ class MemoryNodeManager:
         Returns:
             Dict with memory_write_status and memory_available
         """
+        # Log entry to memory_write_node
+        logger.info(
+            f"memory_write_node: START (conversation_id={state.conversation_id}, "
+            f"trace_id={state.trace_id}, authorized={state.memory_write_authorized})"
+        )
+        
         # Safety check: should only be called if authorized
         if not state.memory_write_authorized:
+            logger.debug(
+                f"memory_write_node: Not authorized for conversation {state.conversation_id}"
+            )
             return {
                 "memory_write_status": None,
                 "memory_available": state.memory_available,
@@ -149,25 +162,40 @@ class MemoryNodeManager:
 
         # Execute write (never crashes)
         try:
+            logger.debug(
+                f"memory_write_node: Calling write() for {state.conversation_id}"
+            )
             response = self.memory_controller.write(request)
 
             if response.status == "success":
+                logger.info(
+                    f"memory_write_node: SUCCESS for {state.conversation_id}"
+                )
                 return {
                     "memory_write_status": "success",
                     "memory_available": True,
                 }
             elif response.status == "failed":
+                logger.warning(
+                    f"memory_write_node: FAILED for {state.conversation_id}: {response.error}"
+                )
                 return {
                     "memory_write_status": "failed",
                     "memory_available": True,
                 }
             else:  # unauthorized, etc.
+                logger.warning(
+                    f"memory_write_node: {response.status.upper()} for {state.conversation_id}"
+                )
                 return {
                     "memory_write_status": response.status,
                     "memory_available": True,
                 }
         except Exception as e:
             # Memory failure is non-fatal
+            logger.error(
+                f"memory_write_node: EXCEPTION for {state.conversation_id}: {str(e)}"
+            )
             return {
                 "memory_write_status": "failed",
                 "memory_available": False,

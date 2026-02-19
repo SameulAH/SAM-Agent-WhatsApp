@@ -27,10 +27,14 @@ Data NEVER stored:
 
 import sqlite3
 import json
+import logging
 from pathlib import Path
 from typing import Optional
 from agent.memory.base import MemoryController
 from agent.memory.types import MemoryReadRequest, MemoryReadResponse, MemoryWriteRequest, MemoryWriteResponse
+
+# Get logger for memory operations
+logger = logging.getLogger(__name__)
 
 
 class SQLiteShortTermMemoryStore(MemoryController):
@@ -63,10 +67,16 @@ class SQLiteShortTermMemoryStore(MemoryController):
         Initialize SQLite database and schema.
         
         Called once at startup. If database already exists, this is a no-op.
+        Enables WAL mode for durability and concurrency.
         """
         try:
             conn = sqlite3.connect(self.db_path)
             cursor = conn.cursor()
+            
+            # Enable WAL mode for better concurrency and crash recovery
+            if self.db_path != ":memory:":
+                cursor.execute("PRAGMA journal_mode=WAL")
+                cursor.execute("PRAGMA synchronous=FULL")
 
             # Create short_term_memory table if it doesn't exist
             cursor.execute("""
@@ -89,9 +99,12 @@ class SQLiteShortTermMemoryStore(MemoryController):
 
             conn.commit()
             conn.close()
+            
+            logger.debug(f"SQLite memory initialized: {self.db_path}")
         except Exception as e:
             # Log initialization error but don't raise
             # Database will be marked unavailable on first operation
+            logger.error(f"Failed to initialize SQLite memory: {str(e)}")
             pass
 
     def read(self, request: MemoryReadRequest) -> MemoryReadResponse:
@@ -108,6 +121,7 @@ class SQLiteShortTermMemoryStore(MemoryController):
         """
         # Check authorization
         if not request.authorized:
+            logger.debug(f"Memory read unauthorized: {request.conversation_id}")
             return MemoryReadResponse(
                 status="unauthorized",
                 error="Memory read not authorized by decision_logic_node",
@@ -129,6 +143,7 @@ class SQLiteShortTermMemoryStore(MemoryController):
             conn.close()
 
             if row is None:
+                logger.debug(f"Memory key not found: {request.conversation_id}, key={request.key}")
                 return MemoryReadResponse(
                     status="not_found",
                     error=f"Key '{request.key}' not found in conversation memory",
@@ -137,8 +152,10 @@ class SQLiteShortTermMemoryStore(MemoryController):
             # Parse JSON data
             try:
                 data = json.loads(row[0])
+                logger.debug(f"Memory read successful: {request.conversation_id}, key={request.key}")
                 return MemoryReadResponse(status="success", data=data)
             except json.JSONDecodeError as e:
+                logger.error(f"Corrupted memory data: {request.conversation_id}, {str(e)}")
                 return MemoryReadResponse(
                     status="failed",
                     error=f"Corrupted memory data: {str(e)}",
@@ -146,6 +163,7 @@ class SQLiteShortTermMemoryStore(MemoryController):
 
         except sqlite3.OperationalError as e:
             # Database locked, file missing, corrupted, etc.
+            logger.error(f"SQLite operational error during read: {str(e)}")
             return MemoryReadResponse(
                 status="unavailable",
                 error=f"Memory unavailable: {str(e)}",
@@ -171,6 +189,7 @@ class SQLiteShortTermMemoryStore(MemoryController):
         """
         # Check authorization
         if not request.authorized:
+            logger.debug(f"Memory write unauthorized: {request.conversation_id}")
             return MemoryWriteResponse(
                 status="unauthorized",
                 error="Memory write not authorized by decision_logic_node",
@@ -194,25 +213,30 @@ class SQLiteShortTermMemoryStore(MemoryController):
                 (request.conversation_id, request.key, data_json),
             )
 
+            # Explicit commit for durability
             conn.commit()
             conn.close()
-
+            
+            logger.info(f"Memory write successful: conversation_id={request.conversation_id}, key={request.key}")
             return MemoryWriteResponse(status="success")
 
         except sqlite3.OperationalError as e:
             # Database locked, file missing, corrupted, etc.
+            logger.error(f"SQLite operational error during write: {request.conversation_id}, {str(e)}")
             return MemoryWriteResponse(
                 status="failed",
                 error=f"Memory unavailable: {str(e)}",
             )
         except (json.JSONDecodeError, TypeError) as e:
             # Data not JSON-serializable
+            logger.error(f"Data not JSON-serializable: {request.conversation_id}, {str(e)}")
             return MemoryWriteResponse(
                 status="failed",
                 error=f"Data not JSON-serializable: {str(e)}",
             )
         except Exception as e:
             # Unexpected error
+            logger.error(f"Memory write failed unexpectedly: {request.conversation_id}, {str(e)}")
             return MemoryWriteResponse(
                 status="failed",
                 error=f"Memory write failed: {str(e)}",

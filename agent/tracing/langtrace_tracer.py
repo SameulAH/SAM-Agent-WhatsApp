@@ -10,7 +10,7 @@ Frozen constraints:
 - Only allowed data is traced
 """
 
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, Callable
 import json
 
 from agent.tracing.tracer import Tracer, TraceMetadata, NoOpTracer
@@ -25,13 +25,15 @@ class LangTraceTracer(Tracer):
     Safe to fail silently → agent continues unchanged.
     """
 
-    def __init__(self, enabled: bool = True):
+    def __init__(self, enabled: bool = True, observability_sink: Optional[Callable] = None):
         """
         Initialize LangTrace tracer.
 
         Args:
             enabled: Whether to enable tracing. If False, acts as NoOpTracer.
+            observability_sink: Optional callback for recording to observability store
         """
+        super().__init__(observability_sink)
         self._enabled = enabled
         self._langsmith_client = None
 
@@ -56,6 +58,17 @@ class LangTraceTracer(Tracer):
             return None
 
         try:
+            # Record to observability sink if available
+            if self.observability_sink:
+                try:
+                    self.observability_sink("span_start", {
+                        "trace_id": trace_metadata.trace_id,
+                        "conversation_id": trace_metadata.conversation_id,
+                        "node_name": name,
+                    })
+                except Exception:
+                    pass  # Observability failure is non-fatal
+
             # Build trace input with allowed metadata only
             trace_input = {
                 "node_name": name,
@@ -97,6 +110,18 @@ class LangTraceTracer(Tracer):
             return
 
         try:
+            # Record to observability sink if available
+            if self.observability_sink:
+                try:
+                    self.observability_sink("span_end", {
+                        "trace_id": span.get("trace_id"),
+                        "span_name": span.get("span_name"),
+                        "status": status,
+                        "duration_ms": metadata.get("duration_ms"),
+                    })
+                except Exception:
+                    pass  # Observability failure is non-fatal
+
             # Build safe output
             safe_metadata = self._filter_safe_metadata(metadata)
 

@@ -14,22 +14,17 @@ authors = [
 ]
 
 dependencies = [
-    # Core dependencies
-    "langgraph>=0.0.50",
-    "langchain>=0.1.0",
-    "pydantic>=2.0",
-    # LLM
-    "requests>=2.31.0",  # For Ollama API calls
-    # STT (optional)
-    "openai-whisper>=20230314",  # Local speech-to-text
-    # TTS (optional)
-    "TTS>=0.19.0",  # Coqui TTS
-    # Long-term memory (optional)
-    "qdrant-client>=2.7.0",  # Vector database client
-    # Observability
-    "langsmith>=0.0.1",
+  "langgraph>=0.0.50",
+  "langchain>=0.1.0",
+  "pydantic>=2.0",
+  "requests>=2.31.0",
+  "python-dotenv>=1.0.0",
+  "qdrant-client>=1.14,<2.0",
+  "openai-whisper>=20230314",
+  "TTS>=0.22.0",
+  "fastapi>=0.104.0",
+  "uvicorn>=0.24.0"
 ]
-
 [project.optional-dependencies]
 dev = [
     "pytest>=7.4.0",

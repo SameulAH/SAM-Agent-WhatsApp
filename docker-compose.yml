@@ -1,0 +1,196 @@
+# ============================================================================
+# SAM Agent Docker Compose Configuration
+# 
+# Profiles:
+#   - dev (default): Fast development setup, hot reload
+#   - prod-cpu: Production on CPU, optimized for performance
+#   - prod-gpu: Production on GPU, CUDA enabled
+#
+# Usage:
+#   # Development (default)
+#   docker-compose up
+#
+#   # Production CPU
+#   docker-compose --profile prod-cpu up
+#
+#   # Production GPU
+#   docker-compose --profile prod-gpu up
+#
+# ============================================================================
+
+services:
+  # =========================================================================
+  # Agent Service (Core)
+  # =========================================================================
+  agent:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.agent
+      target: ${BUILD_TARGET:-final-base}
+      args:
+        PROFILE: ${COMPOSE_PROFILE:-dev}
+        GIT_COMMIT: ${GIT_COMMIT:-unknown}
+        BUILD_DATE: ${BUILD_DATE:-unknown}
+        INSTALL_WHISPER: ${INSTALL_WHISPER:-true}
+        INSTALL_COQUI: ${INSTALL_COQUI:-true}
+    
+    container_name: sam-agent
+    
+    # Network configuration
+    networks:
+      - sam_network
+    
+    # Port mapping
+    ports:
+      - "${AGENT_PORT:-8000}:8000"
+    
+    # Environment configuration
+    environment:
+      # LLM Backend
+      LLM_BACKEND: ${LLM_BACKEND:-ollama}
+      OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-http://ollama:11434}
+      OLLAMA_MODEL: ${OLLAMA_MODEL:-llama3}
+      
+      # STT Configuration (optional)
+      STT_ENABLED: ${STT_ENABLED:-true}
+      STT_BACKEND: ${STT_BACKEND:-whisper}
+      WHISPER_MODEL: ${WHISPER_MODEL:-base}
+      WHISPER_DEVICE: ${WHISPER_DEVICE:-cpu}
+      
+      # TTS Configuration (optional)
+      TTS_ENABLED: ${TTS_ENABLED:-false}
+      TTS_BACKEND: ${TTS_BACKEND:-coqui}
+      COQUI_MODEL: ${COQUI_MODEL:-tts_models/en/ljspeech/glow-tts}
+      COQUI_DEVICE: ${COQUI_DEVICE:-cpu}
+      
+      # Short-term Memory Backend
+      STM_BACKEND: ${STM_BACKEND:-sqlite}
+      
+      # Long-term Memory Backend
+      LTM_BACKEND: ${LTM_BACKEND:-stub}
+      QDRANT_URL: ${QDRANT_URL:-http://qdrant:6333}
+      QDRANT_API_KEY: ${QDRANT_API_KEY:-}
+      
+      # Database
+      DATABASE_PATH: /app/data/memory.db
+      
+      # Observability - LangChain/LangSmith Integration
+      LANGCHAIN_TRACING_V2: ${LANGCHAIN_TRACING_V2:-true}
+      LANGCHAIN_API_KEY: ${LANGCHAIN_API_KEY:-}
+      LANGCHAIN_PROJECT: ${LANGCHAIN_PROJECT:-SAM-Agent}
+      LANGCHAIN_ENDPOINT: ${LANGCHAIN_ENDPOINT:-https://api.smith.langchain.com}
+      LANGSMITH_PROJECT: ${LANGSMITH_PROJECT:-}
+      
+      # Python
+      PYTHONUNBUFFERED: "1"
+      PYTHONDONTWRITEBYTECODE: "1"
+    
+    # Volume mounts
+    volumes:
+      # SQLite database persistence
+      - sqlite_data:/app/data
+      
+      # Whisper model cache (optional)
+      - whisper_cache:/root/.cache/whisper:cached
+      
+      # Coqui TTS model cache (optional)
+      - coqui_cache:/root/.local/share/tts_models:cached
+      
+      # Development hot reload (dev profile only)
+      - .:/app:cached
+    
+    # Health checks
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health/live')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    
+    # Dependency management
+    depends_on:
+      ollama:
+        condition: service_started
+      qdrant:
+        condition: service_started
+        required: false
+    
+    # Always restart on failure
+    restart: unless-stopped
+    
+    # Security
+    user: "1000:1000"
+  
+  # =========================================================================
+  # Ollama LLM Service (Required)
+  # =========================================================================
+  ollama:
+    image: ollama/ollama:latest
+    container_name: sam-agent-ollama
+    
+    networks:
+      - sam_network
+    
+    ports:
+      - "${OLLAMA_PORT:-11434}:11434"
+    
+    environment:
+      - OLLAMA_KEEP_ALIVE=24h
+      - OLLAMA_MODELS=/var/lib/ollama/models
+    
+    volumes:
+      - ollama_data:/var/lib/ollama
+    
+    restart: unless-stopped
+  
+  # =========================================================================
+  # Qdrant Vector Database Service (Optional - LTM)
+  # =========================================================================
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: sam-agent-qdrant
+    
+    networks:
+      - sam_network
+    
+    ports:
+      - "${QDRANT_PORT:-6333}:6333"
+    
+    environment:
+      - QDRANT_API_KEY=${QDRANT_API_KEY:-}
+    
+    volumes:
+      - qdrant_data:/qdrant/storage
+    
+    restart: unless-stopped
+
+# ============================================================================
+# Networks
+# ============================================================================
+networks:
+  sam_network:
+    driver: bridge
+
+# ============================================================================
+# Volumes
+# ============================================================================
+volumes:
+  # Agent SQLite database
+  sqlite_data:
+    driver: local
+  
+  # Ollama model cache
+  ollama_data:
+    driver: local
+  
+  # Qdrant vector storage
+  qdrant_data:
+    driver: local
+  
+  # Whisper model cache
+  whisper_cache:
+    driver: local
+  
+  # Coqui TTS model cache
+  coqui_cache:
+    driver: local

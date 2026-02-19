@@ -59,7 +59,7 @@ class SAMAgentOrchestrator:
         self.memory_nodes = MemoryNodeManager(self.memory_controller, self.long_term_memory_store)
         self.graph = self._build_graph()
 
-    def _build_graph(self) -> CompiledGraph:
+    def _build_graph(self):
         """
         Build the LangGraph graph with exact structure from skeleton.
         
@@ -310,14 +310,24 @@ class SAMAgentOrchestrator:
                 # No memory read needed, proceed to model
                 return {"command": "call_model"}
         else:
-            # After model call, check if memory write is needed
-            # (placeholder for future logic)
-            if state.memory_write_authorized:
-                # Memory write was requested
+            # After model call
+
+            # Case 1: Memory write authorized but not yet executed
+            if (
+                state.memory_write_authorized
+                and state.memory_write_status is None
+            ):
                 return {"command": "memory_write"}
-            else:
-                # No memory write needed, format response
-                return {"command": "format"}
+
+            # Case 2: Memory write not yet authorized (authorize once)
+            if not state.memory_write_authorized:
+                return {
+                    "command": "memory_write",
+                    "memory_write_authorized": True
+                }
+
+            # Case 3: Memory write already done or skipped
+            return {"command": "format"}
 
     def _task_preprocessing_node(self, state: AgentState) -> Dict[str, Any]:
         """
@@ -373,7 +383,7 @@ class SAMAgentOrchestrator:
             task="respond",
             prompt=state.preprocessing_result or state.raw_input,
             context=None,
-            timeout_s=30,
+            timeout_s=120,
             trace_id=state.trace_id,
         )
 
@@ -460,10 +470,15 @@ class SAMAgentOrchestrator:
         """Error router node implementation (unwrapped)."""
         if not state.model_response:
             error_type = "unknown"
-            fallback_output = "[Error: No model response]"
+            fallback_output = "Sorry, I couldn't get a response. Please try again."
         else:
             error_type = state.model_response.error_type or "unknown"
-            fallback_output = f"[Error: {error_type}]"
+            if error_type == "timeout":
+                fallback_output = "⏳ The response took too long. Please try again — the model may be warming up."
+            elif error_type == "connection":
+                fallback_output = "🔌 Couldn't connect to the AI model. Please try again shortly."
+            else:
+                fallback_output = "Sorry, something went wrong. Please try again."
 
         return {
             "error_type": error_type,
@@ -593,7 +608,7 @@ class SAMAgentOrchestrator:
             conversation_id=conversation_id or str(uuid4()),
             trace_id=trace_id or str(uuid4()),
             created_at="",
-            input_type="",
+            input_type="text",
             raw_input=raw_input,
         )
 
@@ -617,7 +632,7 @@ class SAMAgentOrchestrator:
             conversation_id=conversation_id or "",
             trace_id=trace_id or "",
             created_at="",
-            input_type="",
+            input_type="text",
             raw_input=raw_input,
         )
 

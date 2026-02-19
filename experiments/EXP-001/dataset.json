@@ -1,0 +1,264 @@
+{
+  "metadata": {
+    "dataset_id": "EXP-001-dataset-v1.0",
+    "created_at": "2026-02-09T17:15:00Z",
+    "immutable": true,
+    "total_prompts": 35,
+    "categories": {
+      "deterministic_factual": 10,
+      "short_creative": 8,
+      "contextual": 7,
+      "reasoning": 10
+    },
+    "description": "Fixed baseline dataset for EXP-001. All inputs are immutable once committed."
+  },
+  "prompts": [
+    {
+      "prompt_id": "DET-001",
+      "category": "deterministic_factual",
+      "input": "What is the capital of France?",
+      "expected_difficulty": "trivial",
+      "reason": "Single fact, well-known answer"
+    },
+    {
+      "prompt_id": "DET-002",
+      "category": "deterministic_factual",
+      "input": "What is 2 + 2?",
+      "expected_difficulty": "trivial",
+      "reason": "Basic arithmetic"
+    },
+    {
+      "prompt_id": "DET-003",
+      "category": "deterministic_factual",
+      "input": "What is the chemical symbol for gold?",
+      "expected_difficulty": "easy",
+      "reason": "Factual, single answer"
+    },
+    {
+      "prompt_id": "DET-004",
+      "category": "deterministic_factual",
+      "input": "How many continents are there?",
+      "expected_difficulty": "easy",
+      "reason": "Factual with minor ambiguity (7 or 6)"
+    },
+    {
+      "prompt_id": "DET-005",
+      "category": "deterministic_factual",
+      "input": "What year was the Eiffel Tower built?",
+      "expected_difficulty": "easy",
+      "reason": "Specific historical fact"
+    },
+    {
+      "prompt_id": "DET-006",
+      "category": "deterministic_factual",
+      "input": "What is the largest planet in our solar system?",
+      "expected_difficulty": "easy",
+      "reason": "Well-known factual answer"
+    },
+    {
+      "prompt_id": "DET-007",
+      "category": "deterministic_factual",
+      "input": "How many sides does a triangle have?",
+      "expected_difficulty": "trivial",
+      "reason": "Basic geometry"
+    },
+    {
+      "prompt_id": "DET-008",
+      "category": "deterministic_factual",
+      "input": "What is the smallest prime number?",
+      "expected_difficulty": "easy",
+      "reason": "Mathematical fact"
+    },
+    {
+      "prompt_id": "DET-009",
+      "category": "deterministic_factual",
+      "input": "What is the boiling point of water?",
+      "expected_difficulty": "easy",
+      "reason": "Well-known scientific fact"
+    },
+    {
+      "prompt_id": "DET-010",
+      "category": "deterministic_factual",
+      "input": "How many days are in a week?",
+      "expected_difficulty": "trivial",
+      "reason": "Universal knowledge"
+    },
+    {
+      "prompt_id": "CRE-001",
+      "category": "short_creative",
+      "input": "Tell me a short joke.",
+      "expected_difficulty": "medium",
+      "reason": "Creative, no single correct answer"
+    },
+    {
+      "prompt_id": "CRE-002",
+      "category": "short_creative",
+      "input": "What is your name?",
+      "expected_difficulty": "medium",
+      "reason": "Self-referential, model identity"
+    },
+    {
+      "prompt_id": "CRE-003",
+      "category": "short_creative",
+      "input": "Write a haiku about rain.",
+      "expected_difficulty": "medium",
+      "reason": "Creative writing task"
+    },
+    {
+      "prompt_id": "CRE-004",
+      "category": "short_creative",
+      "input": "Give me an interesting fact.",
+      "expected_difficulty": "medium",
+      "reason": "Creative response with multiple valid answers"
+    },
+    {
+      "prompt_id": "CRE-005",
+      "category": "short_creative",
+      "input": "What makes a good friend?",
+      "expected_difficulty": "high",
+      "reason": "Subjective, philosophical"
+    },
+    {
+      "prompt_id": "CRE-006",
+      "category": "short_creative",
+      "input": "Describe a sunset in one sentence.",
+      "expected_difficulty": "medium",
+      "reason": "Descriptive, poetic"
+    },
+    {
+      "prompt_id": "CRE-007",
+      "category": "short_creative",
+      "input": "What is the meaning of happiness?",
+      "expected_difficulty": "high",
+      "reason": "Philosophical, open-ended"
+    },
+    {
+      "prompt_id": "CRE-008",
+      "category": "short_creative",
+      "input": "Tell me something surprising.",
+      "expected_difficulty": "medium",
+      "reason": "Creative, subjective"
+    },
+    {
+      "prompt_id": "CTX-001",
+      "category": "contextual",
+      "input": "What year is it?",
+      "expected_difficulty": "trivial",
+      "reason": "Requires context awareness"
+    },
+    {
+      "prompt_id": "CTX-002",
+      "category": "contextual",
+      "input": "What month are we in?",
+      "expected_difficulty": "easy",
+      "reason": "Temporal context"
+    },
+    {
+      "prompt_id": "CTX-003",
+      "category": "contextual",
+      "input": "What day of the week is today?",
+      "expected_difficulty": "medium",
+      "reason": "Temporal reasoning"
+    },
+    {
+      "prompt_id": "CTX-004",
+      "category": "contextual",
+      "input": "How many hours until midnight?",
+      "expected_difficulty": "medium",
+      "reason": "Requires time calculation"
+    },
+    {
+      "prompt_id": "CTX-005",
+      "category": "contextual",
+      "input": "What is the current temperature?",
+      "expected_difficulty": "high",
+      "reason": "Real-time environmental data"
+    },
+    {
+      "prompt_id": "CTX-006",
+      "category": "contextual",
+      "input": "Where am I located?",
+      "expected_difficulty": "high",
+      "reason": "Requires location awareness"
+    },
+    {
+      "prompt_id": "CTX-007",
+      "category": "contextual",
+      "input": "What is today's date?",
+      "expected_difficulty": "trivial",
+      "reason": "Temporal context"
+    },
+    {
+      "prompt_id": "REA-001",
+      "category": "reasoning",
+      "input": "If it takes 5 minutes to cook an egg, how long does it take to cook 3 eggs?",
+      "expected_difficulty": "medium",
+      "reason": "Simple logical reasoning"
+    },
+    {
+      "prompt_id": "REA-002",
+      "category": "reasoning",
+      "input": "What would happen if there were no gravity?",
+      "expected_difficulty": "high",
+      "reason": "Hypothetical reasoning"
+    },
+    {
+      "prompt_id": "REA-003",
+      "category": "reasoning",
+      "input": "Can you explain why the sky is blue?",
+      "expected_difficulty": "medium",
+      "reason": "Scientific explanation"
+    },
+    {
+      "prompt_id": "REA-004",
+      "category": "reasoning",
+      "input": "What are the pros and cons of artificial intelligence?",
+      "expected_difficulty": "high",
+      "reason": "Balanced reasoning, multiple perspectives"
+    },
+    {
+      "prompt_id": "REA-005",
+      "category": "reasoning",
+      "input": "Why do plants need sunlight?",
+      "expected_difficulty": "easy",
+      "reason": "Basic scientific reasoning"
+    },
+    {
+      "prompt_id": "REA-006",
+      "category": "reasoning",
+      "input": "What is the difference between weather and climate?",
+      "expected_difficulty": "medium",
+      "reason": "Conceptual distinction"
+    },
+    {
+      "prompt_id": "REA-007",
+      "category": "reasoning",
+      "input": "How does photosynthesis work?",
+      "expected_difficulty": "high",
+      "reason": "Complex biological process"
+    },
+    {
+      "prompt_id": "REA-008",
+      "category": "reasoning",
+      "input": "Why is it important to drink water?",
+      "expected_difficulty": "easy",
+      "reason": "Health reasoning"
+    },
+    {
+      "prompt_id": "REA-009",
+      "category": "reasoning",
+      "input": "What makes an effective leader?",
+      "expected_difficulty": "high",
+      "reason": "Subjective reasoning about qualities"
+    },
+    {
+      "prompt_id": "REA-010",
+      "category": "reasoning",
+      "input": "How do ecosystems maintain balance?",
+      "expected_difficulty": "high",
+      "reason": "Complex systems thinking"
+    }
+  ],
+  "immutability_statement": "This dataset is immutable. No modifications allowed after creation. All analysis must use this exact set of 35 prompts.",
+  "checksum": "EXP-001-baseline-v1.0-35prompts"
+}
