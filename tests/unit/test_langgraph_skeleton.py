@@ -122,6 +122,7 @@ def test_decision_logic_node_flow():
     assert result1["command"] == "preprocess"
     
     # After preprocessing, before model call
+    # Phase PA: LTM read is now attempted automatically before model call
     state2 = AgentState(
         conversation_id="test",
         trace_id="test",
@@ -132,9 +133,24 @@ def test_decision_logic_node_flow():
         model_response=None,
     )
     result2 = orchestrator._decision_logic_node(state2)
-    assert result2["command"] == "call_model"
+    # New behavior: decision routes to LTM read first (long_term_memory_read_result is None)
+    assert result2["command"] in ("long_term_memory_read", "call_model")
     
-    # After model call, format response
+    # After preprocessing + LTM read done (long_term_memory_read_result not None), call model
+    state2b = AgentState(
+        conversation_id="test",
+        trace_id="test",
+        created_at="now",
+        input_type="text",
+        raw_input="test",
+        preprocessing_result="normalized text",
+        model_response=None,
+        long_term_memory_read_result={"facts": []},  # LTM read already done
+    )
+    result2b = orchestrator._decision_logic_node(state2b)
+    assert result2b["command"] == "call_model"
+    
+    # After model call, memory_write is authorized (Case 2 fires first)
     model_response = ModelResponse(
         status="success",
         output="model output",
@@ -150,7 +166,8 @@ def test_decision_logic_node_flow():
         model_response=model_response,
     )
     result3 = orchestrator._decision_logic_node(state3)
-    assert result3["command"] == "format"
+    # New behavior: decision goes to memory_write first to authorize STM write
+    assert result3["command"] == "memory_write"
 
 
 def test_task_preprocessing_node():

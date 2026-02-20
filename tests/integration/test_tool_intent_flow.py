@@ -57,13 +57,17 @@ class FirstCallToolModel(ModelBackend):
                 },
             )
         else:
-            # Second call (with tool context): return final answer
-            context_received = request.context or ""
+            # Second call: tool context is now embedded in request.prompt via build_prompt()
+            prompt_received = request.prompt or ""
+            context_in_prompt = "Tool Results:" in prompt_received
+            # Fallback: also check legacy context field
+            context_in_field = bool(request.context or "")
+            context_used = context_in_prompt or context_in_field
             return ModelResponse(
                 status="success",
                 output=(
                     f"Based on search results: The EU AI Act is a comprehensive regulation. "
-                    f"[context_used={bool(context_received)}]"
+                    f"[context_used={context_used}]"
                 ),
                 metadata={},
             )

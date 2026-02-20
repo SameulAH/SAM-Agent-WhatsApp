@@ -9,8 +9,12 @@ Enforces:
 - Max 3 facts per turn
 - Deterministic schema
 - Non-blocking failures
+
+Phase PA (Personal Assistant): Added personal fact patterns for birthday,
+preferences, workplace, identity, and location.  Added "persona_fact" type.
 """
 
+import re
 from datetime import datetime
 from typing import List, Optional, Literal
 from uuid import uuid4
@@ -29,7 +33,7 @@ class ExtractedFact(BaseModel):
     """
     
     fact_id: str = Field(default_factory=lambda: str(uuid4()))
-    type: Literal["preference", "personal_fact", "goal", "task"]
+    type: Literal["preference", "personal_fact", "persona_fact", "goal", "task"]
     content: str = Field(..., max_length=512)
     confidence: float = Field(..., ge=0.0, le=1.0)
     timestamp: datetime = Field(default_factory=datetime.utcnow)
@@ -64,12 +68,73 @@ class FactExtractionResponse(BaseModel):
     extraction_error: Optional[str] = None
 
 
+# ── Personal fact patterns ──────────────────────────────────────────────────
+# Each entry: (compiled regex, fact_type, confidence)
+# Patterns are applied in order; first match per sentence wins.
+_PERSONAL_PATTERNS: List[tuple] = [
+    # Birthday / date of birth
+    (re.compile(
+        r"(?:my\s+birthday\s+is|i\s+was\s+born\s+on|my\s+birth(?:day|date)\s+is)\s+(.+)",
+        re.IGNORECASE,
+    ), "persona_fact", 0.95),
+
+    # Full name
+    (re.compile(
+        r"(?:my\s+name\s+is|i\s+am\s+called|call\s+me)\s+([A-Za-z][A-Za-z\s\-']{1,50})",
+        re.IGNORECASE,
+    ), "persona_fact", 0.95),
+
+    # Workplace / employer
+    (re.compile(
+        r"(?:i\s+work\s+(?:at|for)|i\s+am\s+employed\s+(?:at|by)|my\s+(?:employer|company|job)\s+is)\s+(.+)",
+        re.IGNORECASE,
+    ), "persona_fact", 0.90),
+
+    # Location / home
+    (re.compile(
+        r"(?:i\s+live\s+in|i\s+am\s+(?:based|located)\s+in|i\s+(?:reside|stay)\s+in)\s+(.+)",
+        re.IGNORECASE,
+    ), "persona_fact", 0.90),
+
+    # Preferences (food, activity, color, …)
+    (re.compile(
+        r"i\s+(?:prefer|love|like|enjoy|hate|dislike|don't\s+like)\s+(.+)",
+        re.IGNORECASE,
+    ), "preference", 0.85),
+
+    # Goals
+    (re.compile(
+        r"i\s+(?:want\s+to|would\s+like\s+to|am\s+trying\s+to|aim\s+to|plan\s+to)\s+(.+)",
+        re.IGNORECASE,
+    ), "goal", 0.80),
+
+    # Tasks / reminders
+    (re.compile(
+        r"(?:remind\s+me\s+to|i\s+need\s+to|i\s+have\s+to|don't\s+forget\s+to)\s+(.+)",
+        re.IGNORECASE,
+    ), "task", 0.80),
+
+    # Personal descriptors ("I am a doctor", "I am 30 years old")
+    (re.compile(
+        r"i\s+am\s+(?:a\s+|an\s+)?([A-Za-z][A-Za-z\s\-']{2,60})",
+        re.IGNORECASE,
+    ), "personal_fact", 0.75),
+]
+
+# Sentences to skip (too short or meta-conversational)
+_MIN_CONTENT_LEN = 5
+_SKIP_PATTERNS = re.compile(
+    r"^(ok|okay|sure|yes|no|hi|hello|thanks|thank\s+you|got\s+it|alright)\b",
+    re.IGNORECASE,
+)
+
+
 class FactExtractor:
     """
     Extract facts from conversation turns.
     
     Guardrails:
-    - Only extract: preferences, personal facts, goals, tasks
+    - Only extract: preferences, personal facts, persona_facts, goals, tasks
     - Confidence threshold: >= 0.7
     - Max 3 facts per turn
     - Reject vague or empty content
@@ -144,14 +209,18 @@ class FactExtractor:
         source: str,
     ) -> List[ExtractedFact]:
         """
-        Extract facts from a text block.
-        
-        Heuristic rules (deterministic):
-        - Mentions of "I want" → goal (confidence 0.8)
-        - Mentions of "I prefer" → preference (confidence 0.85)
-        - Personal descriptors ("I am X") → personal_fact (confidence 0.75)
-        - Action items ("I will", "I need to") → task (confidence 0.8)
-        
+        Extract facts from a text block using deterministic pattern matching.
+
+        Patterns (in priority order):
+        - Birthday / date of birth → persona_fact (confidence 0.95)
+        - Full name → persona_fact (confidence 0.95)
+        - Workplace / employer → persona_fact (confidence 0.90)
+        - Location / home → persona_fact (confidence 0.90)
+        - Preferences → preference (confidence 0.85)
+        - Goals ("I want to…") → goal (confidence 0.80)
+        - Tasks / reminders → task (confidence 0.80)
+        - Personal descriptors ("I am a…") → personal_fact (confidence 0.75)
+
         Args:
             text: Text to extract from
             turn_id: Conversation turn ID
@@ -160,17 +229,62 @@ class FactExtractor:
         Returns:
             List of ExtractedFact (may be empty)
         """
-        
         facts: List[ExtractedFact] = []
-        
-        # TODO: Implement deterministic extraction heuristics
-        # For now, return empty (no facts)
-        # In production, use NLP or ML-based extraction
-        
+        seen_contents: set = set()
+
+        # Split on sentence boundaries for finer-grained matching
+        sentences = re.split(r"(?<=[.!?])\s+|\n+", text.strip())
+        # Also try the whole text as one unit
+        candidates = sentences + [text.strip()]
+
+        for sentence in candidates:
+            sentence = sentence.strip()
+            if len(sentence) < _MIN_CONTENT_LEN:
+                continue
+            if _SKIP_PATTERNS.match(sentence):
+                continue
+
+            for pattern, fact_type, confidence in _PERSONAL_PATTERNS:
+                match = pattern.search(sentence)
+                if match:
+                    # Extract the captured content (first group)
+                    captured = match.group(1).strip().rstrip(".!?,;")
+                    if len(captured) < _MIN_CONTENT_LEN:
+                        continue
+
+                    # Build human-readable content string
+                    # Include the trigger phrase for context
+                    full_sentence = sentence.strip().rstrip(".!?")
+                    if len(full_sentence) > 512:
+                        full_sentence = full_sentence[:509] + "..."
+
+                    # Dedup by content
+                    if full_sentence.lower() in seen_contents:
+                        continue
+                    seen_contents.add(full_sentence.lower())
+
+                    try:
+                        fact = ExtractedFact(
+                            type=fact_type,
+                            content=full_sentence,
+                            confidence=confidence,
+                            source_turn_id=turn_id,
+                        )
+                        facts.append(fact)
+                    except Exception:
+                        # Skip invalid facts silently
+                        pass
+
+                    # Only match the highest-priority pattern per sentence
+                    break
+
+            if len(facts) >= self.MAX_FACTS_PER_TURN:
+                break
+
         return facts
 
 
-def get_fact_extractor() -> FactExtractor:
+def get_fact_extractor() -> "FactExtractor":
     """Get singleton fact extractor instance."""
     global _fact_extractor
     if _fact_extractor is None:

@@ -21,12 +21,13 @@ import time
 
 from langgraph.graph import StateGraph
 
-from inference import ModelBackend, ModelRequest, StubModelBackend
+from inference import ModelBackend, ModelRequest, ModelResponse, StubModelBackend
 from agent.state_schema import AgentState
 from agent.memory import MemoryController, StubMemoryController, LongTermMemoryStore, StubLongTermMemoryStore
 from agent.memory_nodes import MemoryNodeManager
 from agent.tracing import Tracer, TraceMetadata, NoOpTracer
 from agent.mcp.guardrails import MCPGuardrails, GuardrailViolation
+from agent.prompting.prompt_builder import SYSTEM_PROMPT, build_prompt
 
 
 class SAMAgentOrchestrator:
@@ -42,6 +43,16 @@ class SAMAgentOrchestrator:
     - Memory is not accessed yet
     - All failures are explicit and typed
     """
+
+    # ── Output guardrails ─────────────────────────────────────────────────────
+    MAX_OUTPUT_CHARS: int = 800          # Hard ceiling on final response length
+    MAX_OUTPUT_SENTENCES: int = 5        # Soft ceiling (applied before char limit)
+
+    # ── Freshness keywords that trigger forced web_search ────────────────────
+    _FRESHNESS_KEYWORDS: frozenset = frozenset({
+        "today", "latest", "current", "recent", "breaking", "news",
+        "right now", "currently", "now", "live", "update", "updates",
+    })
 
     def __init__(
         self,
@@ -296,34 +307,43 @@ class SAMAgentOrchestrator:
         
         Command sequence (with optional memory and tool execution):
         1. After state_init: preprocess
-        2. After preprocessing: memory_read (if needed) OR call_model
-        3. After memory_read: call_model
+        2. After preprocessing: STM read (if authorized) → LTM read → call_model
+        3. After memory_read / ltm_read: call_model
         4. After model_call:
            a. If model emitted tool_call AND tool not yet executed → execute_tool
-           b. Else: memory_write (if needed) OR format
-        5. After tool_execution: call_model (model_response was cleared by tool node)
-        6. After memory_write: format
+           b. If freshness keywords in query AND no tool_call AND not yet executed → forced execute_tool
+           c. Else: memory_write → long_term_memory_write → format
+        5. After tool_execution: call_model (model_response cleared by tool node)
+        6. After memory_write: long_term_memory_write → format
         
         Rules:
         - Must NOT execute tasks
         - Must NOT call model
-        - Must NOT mutate state directly (only set command)
+        - Must NOT mutate state directly (only set command + forced_tool metadata)
         - Tool call authority: tool_call_count < 1 (guardrail: max 1 per turn)
         
         Note: Tracing NOT wrapped here (decision logic is not observed externally).
         """
+        trace_metadata = self._create_trace_metadata(state)
+
         # ── Phase 1: Pre-processing ──────────────────────────────────────────
         if state.preprocessing_result is None:
             return {"command": "preprocess"}
 
         # ── Phase 2: Before model call ───────────────────────────────────────
         if state.model_response is None:
-            # Post-tool re-call: skip memory read (already done in turn 1)
+            # Post-tool re-call: skip memory reads (already done in turn 1)
             if state.tool_executed:
                 return {"command": "call_model"}
-            # Normal path: check if memory read is needed
+            # STM read if authorized and not yet executed
             if state.memory_read_authorized and state.memory_read_result is None:
                 return {"command": "memory_read"}
+            # LTM read: attempt once per turn if not yet done and store is available
+            if (
+                state.long_term_memory_read_result is None
+                and state.long_term_memory_status == "available"
+            ):
+                return {"command": "long_term_memory_read"}
             return {"command": "call_model"}
 
         # ── Phase 3: After model call ────────────────────────────────────────
@@ -344,19 +364,72 @@ class SAMAgentOrchestrator:
             and state.tool_call_count < MCPGuardrails.MAX_TOOL_CALLS_PER_TURN
         ):
             # Emit trace event for tool_call_detected
-            trace_metadata = self._create_trace_metadata(state)
             try:
                 self.tracer.record_event(
                     name="tool_call_detected",
                     metadata={
                         "tool_name": tool_call.get("name"),
                         "tool_call_count": state.tool_call_count,
+                        "forced": False,
                     },
                     trace_metadata=trace_metadata,
                 )
             except Exception:
                 pass
             return {"command": "execute_tool"}
+
+        # ── Phase 3b: Freshness keyword guardrail ────────────────────────────
+        # If the user query contained freshness keywords AND the model did NOT
+        # emit a tool_call, force a web_search by synthesizing the tool_call
+        # and routing to execute_tool.  Prevents model hesitation on time-
+        # sensitive queries.
+        if (
+            not tool_call
+            and not state.tool_executed
+            and state.tool_call_count < MCPGuardrails.MAX_TOOL_CALLS_PER_TURN
+        ):
+            query_lower = (state.preprocessing_result or state.raw_input or "").lower()
+            # Check word-boundary matching for multi-word phrases too
+            has_freshness = any(kw in query_lower for kw in self._FRESHNESS_KEYWORDS)
+
+            if has_freshness:
+                forced_query = state.preprocessing_result or state.raw_input
+                try:
+                    self.tracer.record_event(
+                        name="tool_intent_detected",
+                        metadata={
+                            "query_preview": query_lower[:80],
+                            "trigger": "freshness_keyword_guardrail",
+                        },
+                        trace_metadata=trace_metadata,
+                    )
+                    self.tracer.record_event(
+                        name="forced_tool_call",
+                        metadata={
+                            "tool_name": "web_search",
+                            "reason": "freshness_keyword_no_tool_call",
+                        },
+                        trace_metadata=trace_metadata,
+                    )
+                except Exception:
+                    pass
+                # Synthesize tool_call metadata and route to execute_tool
+                return {
+                    "command": "execute_tool",
+                    "model_response": ModelResponse(
+                        status=state.model_response.status,
+                        output=state.model_response.output or "",
+                        error_type=state.model_response.error_type,
+                        metadata={
+                            **(state.model_response.metadata or {}),
+                            "tool_call": {
+                                "name": "web_search",
+                                "arguments": {"query": forced_query},
+                            },
+                            "forced_tool_call": True,
+                        },
+                    ),
+                }
 
         # ── Phase 4: Post-tool or no-tool memory/format routing ──────────────
         # Case 1: Memory write authorized but not yet executed
@@ -370,7 +443,12 @@ class SAMAgentOrchestrator:
                 "memory_write_authorized": True,
             }
 
-        # Case 3: Memory write done (or skipped) → format
+        # Case 3: STM write done — now check long-term memory write
+        # Write to Qdrant if not yet attempted this turn
+        if state.long_term_memory_write_status is None:
+            return {"command": "long_term_memory_write"}
+
+        # Case 4: All memory done → format
         return {"command": "format"}
 
     def _task_preprocessing_node(self, state: AgentState) -> Dict[str, Any]:
@@ -422,25 +500,78 @@ class SAMAgentOrchestrator:
 
     def _model_call_node_impl(self, state: AgentState) -> Dict[str, Any]:
         """Model call node implementation (unwrapped)."""
-        # Build prompt (may include tool context for second call)
-        base_prompt = state.preprocessing_result or state.raw_input
+        # ── Derive memory context from state memory fields ────────────────────
+        # Combine LTM (retrieved facts) and STM (recent context) into one string
+        memory_context: Optional[str] = None
+        memory_context_parts = []
 
-        # Phase E: Safe context injection (tool results as context, not prompt)
-        # Inject tool_context if available (bounded to 512 tokens ≈ 2048 chars)
-        context = None
-        if state.tool_context:
-            context = state.tool_context[: MCPGuardrails.MAX_TOTAL_CHARS * 2]  # 3000 char max
+        if state.long_term_memory_read_result:
+            facts = state.long_term_memory_read_result.get("facts", [])
+            if facts:
+                lines = [
+                    f"- {f.get('content', f) if isinstance(f.get('content'), str) else str(f.get('content', ''))}"
+                    for f in facts
+                    if f.get("content") or (isinstance(f, dict) and f)
+                ]
+                if lines:
+                    memory_context_parts.append("Remembered facts:\n" + "\n".join(lines))
 
-        # Build request
+        if state.memory_read_result:
+            ctx = (
+                state.memory_read_result.get("final_output")
+                or state.memory_read_result.get("conversation_context")
+            )
+            if ctx:
+                memory_context_parts.append(f"Recent context:\n{ctx}")
+
+        if memory_context_parts:
+            memory_context = "\n\n".join(memory_context_parts)
+
+        # ── Build structured prompt via PromptBuilder ─────────────────────────
+        user_input = state.preprocessing_result or state.raw_input
+        prompt = build_prompt(
+            system_prompt=SYSTEM_PROMPT,
+            user_input=user_input,
+            memory_context=memory_context,
+            tool_context=state.tool_context,
+        )
+
+        trace_metadata = self._create_trace_metadata(state)
+
+        # Emit prompt_built trace event
+        try:
+            self.tracer.record_event(
+                name="prompt_built",
+                metadata={
+                    "has_memory_context": memory_context is not None,
+                    "has_tool_context": state.tool_context is not None,
+                    "prompt_length": len(prompt),
+                },
+                trace_metadata=trace_metadata,
+            )
+        except Exception:
+            pass
+
+        # Emit memory_injected trace event if memory was used
+        if memory_context:
+            try:
+                self.tracer.record_event(
+                    name="memory_injected",
+                    metadata={"memory_context_length": len(memory_context)},
+                    trace_metadata=trace_metadata,
+                )
+            except Exception:
+                pass
+
+        # ── Build ModelRequest (context already embedded in prompt) ───────────
         request = ModelRequest(
             task="respond",
-            prompt=base_prompt,
-            context=context,
+            prompt=prompt,
+            context=None,   # tool_context is now embedded in prompt via build_prompt
             timeout_s=120,
             trace_id=state.trace_id,
         )
 
-        trace_metadata = self._create_trace_metadata(state)
         start_time = time.time()
 
         # Model call span (metadata only, no prompts/outputs)
@@ -502,6 +633,38 @@ class SAMAgentOrchestrator:
         else:
             # This shouldn't happen if routing is correct, but be explicit
             final_output = None
+
+        # ── Phase 5: Output conciseness enforcement ───────────────────────────
+        if final_output:
+            original_len = len(final_output)
+            truncated = False
+
+            # Soft limit: cap at MAX_OUTPUT_SENTENCES (split on sentence endings)
+            import re as _re
+            sentences = _re.split(r"(?<=[.!?])\s+", final_output.strip())
+            if len(sentences) > self.MAX_OUTPUT_SENTENCES:
+                final_output = " ".join(sentences[: self.MAX_OUTPUT_SENTENCES]).strip()
+                truncated = True
+
+            # Hard limit: absolute character ceiling
+            if len(final_output) > self.MAX_OUTPUT_CHARS:
+                final_output = final_output[: self.MAX_OUTPUT_CHARS] + "..."
+                truncated = True
+
+            if truncated:
+                trace_metadata = self._create_trace_metadata(state)
+                try:
+                    self.tracer.record_event(
+                        name="response_truncated",
+                        metadata={
+                            "original_length": original_len,
+                            "final_length": len(final_output),
+                            "max_chars": self.MAX_OUTPUT_CHARS,
+                        },
+                        trace_metadata=trace_metadata,
+                    )
+                except Exception:
+                    pass
 
         return {
             "final_output": final_output,

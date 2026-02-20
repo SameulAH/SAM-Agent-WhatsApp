@@ -6,6 +6,9 @@ Memory reads and writes are routed only when authorized by decision_logic_node.
 
 Phase 2: Short-term memory (MemoryController)
 Phase 3.2: Long-term memory (LongTermMemoryStore)
+Phase PA: Personal assistant fact extraction integrated into LTM write node.
+          Personal facts (birthday, preferences, workplace) are extracted from
+          raw_input and stored as "persona_fact" / "personal_fact" in Qdrant.
 """
 
 import logging
@@ -22,6 +25,10 @@ from agent.memory import (
     MemoryFact,
     LongTermMemoryWriteRequest,
     LongTermMemoryRetrievalQuery,
+)
+from agent.intelligence.fact_extraction import (
+    FactExtractor,
+    FactExtractionRequest,
 )
 
 # Get logger for memory operations
@@ -55,6 +62,7 @@ class MemoryNodeManager:
         """
         self.memory_controller = memory_controller
         self.long_term_memory_store = long_term_memory_store or StubLongTermMemoryStore()
+        self._fact_extractor = FactExtractor()
 
     def memory_read_node(self, state: AgentState) -> Dict[str, Any]:
         """
@@ -209,26 +217,22 @@ class MemoryNodeManager:
         Execute authorized long-term memory retrieval.
         
         Responsibility:
-        - Check authorization
         - Retrieve facts from LongTermMemoryStore
         - Handle failures gracefully (advisory-only)
         
         Rules:
-        - Only runs if memory_read_authorized is True
+        - Routing authority rests with decision_logic_node; if we reach this
+          node, the read is implicitly authorized.
         - Never crashes agent on failure
         - Sets long_term_memory_status="unavailable" if store unavailable
+        - Returns {"facts": []} (empty list sentinel) when no facts found,
+          so decision_logic_node can distinguish "not yet read" (None)
+          from "read but empty" ({"facts": []}).
         - Always returns Dict (never raises exception)
         
         Returns:
             Dict with long_term_memory_read_result and long_term_memory_status
         """
-        # Safety check: should only be called if authorized
-        if not state.memory_read_authorized:
-            return {
-                "long_term_memory_read_result": None,
-                "long_term_memory_status": state.long_term_memory_status,
-            }
-
         # Build retrieval query
         query = LongTermMemoryRetrievalQuery(
             user_id=state.conversation_id,  # Use conversation_id as user_id
@@ -243,34 +247,35 @@ class MemoryNodeManager:
 
             # Handle response
             if response.status == "success":
+                facts = response.facts or []
                 return {
                     "long_term_memory_read_result": {
                         "facts": [
                             {
                                 "fact_type": f.fact_type,
-                                "content": f.content,
+                                "content": f.content if isinstance(f.content, str) else str(f.content),
                                 "confidence": f.confidence,
-                                "created_at": f.created_at.isoformat() if hasattr(f.created_at, "isoformat") else str(f.created_at),
+                                "created_at": f.created_at.isoformat() if hasattr(f.created_at, "isoformat") else str(f.created_at) if f.created_at else None,
                             }
-                            for f in response.facts
+                            for f in facts
                         ]
                     },
                     "long_term_memory_status": "available",
                 }
             elif response.status == "unavailable":
                 return {
-                    "long_term_memory_read_result": None,
+                    "long_term_memory_read_result": {"facts": []},  # sentinel: attempted
                     "long_term_memory_status": "unavailable",
                 }
             else:  # not_found, unauthorized, etc.
                 return {
-                    "long_term_memory_read_result": None,
+                    "long_term_memory_read_result": {"facts": []},  # sentinel: read attempted, no facts
                     "long_term_memory_status": "available",
                 }
         except Exception as e:
             # Long-term memory failure is non-fatal
             return {
-                "long_term_memory_read_result": None,
+                "long_term_memory_read_result": {"facts": []},  # sentinel: attempted but failed
                 "long_term_memory_status": "unavailable",
             }
 
@@ -280,12 +285,16 @@ class MemoryNodeManager:
         
         Responsibility:
         - Check authorization
-        - Write facts to LongTermMemoryStore
+        - Extract personal facts from raw_input via FactExtractor
+        - Write extracted persona/personal facts to LongTermMemoryStore
+        - Write interaction outcome as fallback fact
         - Handle failures gracefully (advisory-only)
         
         Rules:
         - Only runs if memory_write_authorized is True
         - Never crashes agent on failure
+        - Max 3 facts per turn (enforced by FactExtractor)
+        - Personal facts have priority over interaction outcome
         - Sets long_term_memory_status="unavailable" if store unavailable
         - Always returns Dict (never raises exception)
         
@@ -299,52 +308,84 @@ class MemoryNodeManager:
                 "long_term_memory_status": state.long_term_memory_status,
             }
 
-        # Build fact from conversation outcome
-        if not state.final_output:
-            # Nothing to write
+        written_count = 0
+        write_status = "success"
+
+        try:
+            # ── Phase PA: Extract personal facts from user input ──────────────
+            user_input = state.raw_input or state.preprocessing_result or ""
+            if user_input.strip():
+                extraction_request = FactExtractionRequest(
+                    user_input=user_input,
+                    model_response=None,  # Only extract from user statements
+                    conversation_turn_id=state.trace_id,
+                    conversation_id=state.conversation_id,
+                )
+                extraction_response = self._fact_extractor.extract(extraction_request)
+
+                for extracted_fact in extraction_response.extracted_facts:
+                    fact = MemoryFact(
+                        fact_type=extracted_fact.type,  # "persona_fact", "preference", etc.
+                        content={"text": extracted_fact.content, "source": "user_statement"},
+                        user_id=state.conversation_id,
+                        confidence=extracted_fact.confidence,
+                        source="user_input_extraction",
+                    )
+                    write_request = LongTermMemoryWriteRequest(
+                        user_id=state.conversation_id,
+                        fact=fact,
+                        authorized=True,
+                        reason="agent_storing_personal_fact",
+                    )
+                    try:
+                        response = self.long_term_memory_store.write_fact(write_request)
+                        if response.status == "success":
+                            written_count += 1
+                        else:
+                            logger.debug(
+                                f"long_term_memory_write_node: persona fact write status="
+                                f"{response.status} for {state.conversation_id}"
+                            )
+                    except Exception as inner_e:
+                        logger.debug(
+                            f"long_term_memory_write_node: persona fact write exception: {inner_e}"
+                        )
+
+            # ── Interaction outcome (always write if there's output) ───────────
+            if state.final_output:
+                outcome_fact = MemoryFact(
+                    fact_type="interaction_outcome",
+                    content={"text": state.final_output, "source": "agent_response"},
+                    user_id=state.conversation_id,
+                    confidence=0.8,
+                    source="agent_interaction",
+                )
+                outcome_request = LongTermMemoryWriteRequest(
+                    user_id=state.conversation_id,
+                    fact=outcome_fact,
+                    authorized=True,
+                    reason="agent_storing_interaction_outcome",
+                )
+                response = self.long_term_memory_store.write_fact(outcome_request)
+                if response.status == "success":
+                    written_count += 1
+                elif response.status == "failed":
+                    write_status = "failed"
+
+            final_status = "success" if written_count > 0 else write_status
+            logger.info(
+                f"long_term_memory_write_node: wrote {written_count} fact(s) for "
+                f"{state.conversation_id}"
+            )
             return {
-                "long_term_memory_write_status": None,
-                "long_term_memory_status": state.long_term_memory_status,
+                "long_term_memory_write_status": final_status,
+                "long_term_memory_status": "available",
             }
 
-        # Create a memory fact from the interaction
-        fact = MemoryFact(
-            fact_type="interaction_outcome",
-            content=state.final_output,
-            user_id=state.conversation_id,
-            confidence=0.8,  # Default confidence for agent-generated facts
-            source="agent_interaction",
-        )
-
-        # Build write request
-        request = LongTermMemoryWriteRequest(
-            user_id=state.conversation_id,
-            fact=fact,
-            authorized=True,
-            reason="agent_storing_interaction_outcome",
-        )
-
-        # Execute write (never crashes)
-        try:
-            response = self.long_term_memory_store.write_fact(request)
-
-            if response.status == "success":
-                return {
-                    "long_term_memory_write_status": "success",
-                    "long_term_memory_status": "available",
-                }
-            elif response.status == "failed":
-                return {
-                    "long_term_memory_write_status": "failed",
-                    "long_term_memory_status": "available",
-                }
-            else:  # unauthorized, etc.
-                return {
-                    "long_term_memory_write_status": response.status,
-                    "long_term_memory_status": "available",
-                }
         except Exception as e:
-            # Long-term memory failure is non-fatal
+            logger.error(
+                f"long_term_memory_write_node: EXCEPTION for {state.conversation_id}: {e}"
+            )
             return {
                 "long_term_memory_write_status": "failed",
                 "long_term_memory_status": "unavailable",

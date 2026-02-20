@@ -5,37 +5,11 @@ from .base import ModelBackend
 from .types import ModelRequest, ModelResponse
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Tool definitions (injected into the system prompt so the model knows what's
-# available and when to call them).
+# Import the authoritative SYSTEM_PROMPT from the prompt builder layer.
+# This replaces the previously inline _SYSTEM_PROMPT so the behavioral
+# contract is defined in a single place.
 # ──────────────────────────────────────────────────────────────────────────────
-_TOOL_DEFINITIONS = [
-    {
-        "name": "web_search",
-        "description": (
-            "Search the web for real-time or up-to-date information. "
-            "Use this tool whenever the user asks about: current news, recent events, "
-            "live prices, product availability, stock quotes, weather, sports scores, "
-            "latest releases, or any fact that may have changed after your training cutoff."
-        ),
-        "parameters": {
-            "query": "The search query string (concise, specific, in the user's language)"
-        },
-    }
-]
-
-_TOOL_JSON = json.dumps(_TOOL_DEFINITIONS, indent=2)
-
-_SYSTEM_PROMPT = f"""You are SAM, a helpful and concise AI assistant. You have access to the following tools:
-
-{_TOOL_JSON}
-
-TOOL USAGE RULES:
-- When you need real-time or current information, respond with EXACTLY this format and NOTHING else:
-  [TOOL_CALL]{{"name": "web_search", "arguments": {{"query": "<your search query>"}}}}
-- Do NOT add any explanation or text around the [TOOL_CALL] block.
-- After receiving tool results, answer the user's question using those results.
-- If you do NOT need a tool, respond normally without any [TOOL_CALL] marker.
-"""
+from agent.prompting.prompt_builder import SYSTEM_PROMPT as _SYSTEM_PROMPT  # noqa: E402
 
 # Regex to locate the [TOOL_CALL] marker (case-insensitive for robustness)
 _TOOL_CALL_MARKER_RE = re.compile(r"\[TOOL_CALL\]", re.IGNORECASE)
