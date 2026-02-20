@@ -5,10 +5,11 @@ The AgentState is the single source of truth for all agent execution context.
 It is mutated only by specific nodes and never by task execution.
 
 Phase 2 Addition: Memory-related fields store pointers and flags, never knowledge.
+Phase MCP Addition: Tool execution fields track tool calls and results per turn.
 """
 
 from dataclasses import dataclass, field
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 from datetime import datetime
 
 from inference import ModelResponse
@@ -65,6 +66,20 @@ class AgentState:
     long_term_memory_status: str = "available"       # "available" | "unavailable"
     long_term_memory_read_result: Optional[Dict[str, Any]] = None  # Facts retrieved (if authorized)
     long_term_memory_write_status: Optional[str] = None  # Status of long-term fact write
+
+    # ── Tool Execution (Phase MCP) ────────────────────────────────────────────
+    # These fields track tool calls per turn.
+    # Invariants:
+    # - tool_executed is True only AFTER tool_execution_node completes
+    # - tool_call_count increments by 1 per tool execution (guardrail: max 1)
+    # - tool_result stores the raw result dict from the tool
+    # - tool_context stores the formatted, injection-safe string for model re-call
+    # - Tool node NEVER writes to memory_* fields
+    # - Tool node NEVER sets command (decision_logic_node retains authority)
+    tool_executed: bool = False                      # Has a tool been executed this turn?
+    tool_call_count: int = 0                         # Number of tool calls made (guardrail: max 1)
+    tool_result: Optional[Dict[str, Any]] = None     # Raw result from tool execution
+    tool_context: Optional[str] = None              # Formatted tool results for model context
 
     def __post_init__(self):
         """Validate state schema."""

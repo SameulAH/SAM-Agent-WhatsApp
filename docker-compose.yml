@@ -80,6 +80,19 @@ services:
       LANGCHAIN_PROJECT: ${LANGCHAIN_PROJECT:-SAM-Agent}
       LANGCHAIN_ENDPOINT: ${LANGCHAIN_ENDPOINT:-https://api.smith.langchain.com}
       LANGSMITH_PROJECT: ${LANGSMITH_PROJECT:-}
+
+      # MCP Tool Configuration — Semantic Web Search (Exa / Brave / Linkup)
+      # Set at least one provider key. Run connectivity_test.py to verify.
+      # Priority order: Exa → Brave → Linkup
+      EXA_API_KEY: ${EXA_API_KEY:-}
+      BRAVE_API_KEY: ${BRAVE_API_KEY:-}
+      LINKUP_API_KEY: ${LINKUP_API_KEY:-}
+      # Smithery Connect (optional proxy mode — stores credentials server-side)
+      SMITHERY_API_KEY: ${SMITHERY_API_KEY:-}
+      SMITHERY_NAMESPACE: ${SMITHERY_NAMESPACE:-}
+      EXA_CONNECTION_ID: ${EXA_CONNECTION_ID:-}
+      BRAVE_CONNECTION_ID: ${BRAVE_CONNECTION_ID:-}
+      LINKUP_CONNECTION_ID: ${LINKUP_CONNECTION_ID:-}
       
       # Python
       PYTHONUNBUFFERED: "1"

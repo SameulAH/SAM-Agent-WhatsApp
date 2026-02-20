@@ -6,6 +6,12 @@ Implements the exact graph structure defined in design/langgraph_skeleton.md.
 The graph is fully deterministic and stateless except for the AgentState.
 All routing decisions are made by decision_logic_node.
 Task nodes execute without branching.
+
+Phase MCP: Added tool_execution_node and execute_tool routing.
+- decision_logic_node detects tool_call in model metadata
+- tool_execution_node executes the tool, stores result, clears model_response
+- model_call_node is re-invoked with tool_context injected
+- Max 1 tool call per turn enforced via guardrails
 """
 
 from typing import Any, Dict, Optional
@@ -20,6 +26,7 @@ from agent.state_schema import AgentState
 from agent.memory import MemoryController, StubMemoryController, LongTermMemoryStore, StubLongTermMemoryStore
 from agent.memory_nodes import MemoryNodeManager
 from agent.tracing import Tracer, TraceMetadata, NoOpTracer
+from agent.mcp.guardrails import MCPGuardrails, GuardrailViolation
 
 
 class SAMAgentOrchestrator:
@@ -81,6 +88,7 @@ class SAMAgentOrchestrator:
         graph.add_node("memory_write_node", self._memory_write_node_wrapper)  # Phase 2
         graph.add_node("long_term_memory_read_node", self._long_term_memory_read_node_wrapper)  # Phase 3.2
         graph.add_node("long_term_memory_write_node", self._long_term_memory_write_node_wrapper)  # Phase 3.2
+        graph.add_node("tool_execution_node", self._tool_execution_node_wrapper)  # Phase MCP
         graph.add_node("error_router_node", self._error_router_node)
         graph.add_node("format_response_node", self._format_response_node)
 
@@ -100,6 +108,7 @@ class SAMAgentOrchestrator:
                 "memory_read": "memory_read_node",
                 "long_term_memory_read": "long_term_memory_read_node",  # Phase 3.2
                 "call_model": "model_call_node",
+                "execute_tool": "tool_execution_node",  # Phase MCP
                 "memory_write": "memory_write_node",
                 "long_term_memory_write": "long_term_memory_write_node",  # Phase 3.2
                 "format": "format_response_node",
@@ -109,6 +118,7 @@ class SAMAgentOrchestrator:
         graph.add_edge("task_preprocessing_node", "decision_logic_node")
         graph.add_edge("memory_read_node", "decision_logic_node")
         graph.add_edge("long_term_memory_read_node", "decision_logic_node")  # Phase 3.2
+        graph.add_edge("tool_execution_node", "decision_logic_node")  # Phase MCP
         
         # model_call_node branches on success/failure
         graph.add_conditional_edges(
@@ -142,6 +152,8 @@ class SAMAgentOrchestrator:
             return "long_term_memory_read"
         elif state.command == "call_model":
             return "call_model"
+        elif state.command == "execute_tool":  # Phase MCP
+            return "execute_tool"
         elif state.command == "memory_write":
             return "memory_write"
         elif state.command == "long_term_memory_write":  # Phase 3.2
@@ -282,52 +294,84 @@ class SAMAgentOrchestrator:
         
         Responsibility: Emit next command based on state
         
-        Command sequence (with optional memory):
+        Command sequence (with optional memory and tool execution):
         1. After state_init: preprocess
         2. After preprocessing: memory_read (if needed) OR call_model
         3. After memory_read: call_model
-        4. After model_call: memory_write (if needed) OR format
-        5. After memory_write: format
+        4. After model_call:
+           a. If model emitted tool_call AND tool not yet executed → execute_tool
+           b. Else: memory_write (if needed) OR format
+        5. After tool_execution: call_model (model_response was cleared by tool node)
+        6. After memory_write: format
         
         Rules:
         - Must NOT execute tasks
         - Must NOT call model
         - Must NOT mutate state directly (only set command)
+        - Tool call authority: tool_call_count < 1 (guardrail: max 1 per turn)
         
         Note: Tracing NOT wrapped here (decision logic is not observed externally).
         """
-        # Decision logic: pure control flow
+        # ── Phase 1: Pre-processing ──────────────────────────────────────────
         if state.preprocessing_result is None:
-            # After state_init, before preprocessing
             return {"command": "preprocess"}
-        elif state.model_response is None:
-            # After preprocessing, before model call
-            # Check if memory read is needed (placeholder for future logic)
-            if state.memory_read_authorized and state.memory_read_result is None:
-                # Memory read was requested but not yet executed
-                return {"command": "memory_read"}
-            else:
-                # No memory read needed, proceed to model
+
+        # ── Phase 2: Before model call ───────────────────────────────────────
+        if state.model_response is None:
+            # Post-tool re-call: skip memory read (already done in turn 1)
+            if state.tool_executed:
                 return {"command": "call_model"}
-        else:
-            # After model call
+            # Normal path: check if memory read is needed
+            if state.memory_read_authorized and state.memory_read_result is None:
+                return {"command": "memory_read"}
+            return {"command": "call_model"}
 
-            # Case 1: Memory write authorized but not yet executed
-            if (
-                state.memory_write_authorized
-                and state.memory_write_status is None
-            ):
-                return {"command": "memory_write"}
+        # ── Phase 3: After model call ────────────────────────────────────────
+        # Check if model requested a tool call
+        tool_call = (
+            state.model_response.metadata.get("tool_call")
+            if state.model_response.metadata
+            else None
+        )
 
-            # Case 2: Memory write not yet authorized (authorize once)
-            if not state.memory_write_authorized:
-                return {
-                    "command": "memory_write",
-                    "memory_write_authorized": True
-                }
+        # Phase MCP: Route to tool execution if:
+        # 1. Model emitted a tool_call
+        # 2. Tool not yet executed this turn (prevents loops)
+        # 3. Guardrail: tool_call_count < MAX (1 per turn)
+        if (
+            tool_call
+            and not state.tool_executed
+            and state.tool_call_count < MCPGuardrails.MAX_TOOL_CALLS_PER_TURN
+        ):
+            # Emit trace event for tool_call_detected
+            trace_metadata = self._create_trace_metadata(state)
+            try:
+                self.tracer.record_event(
+                    name="tool_call_detected",
+                    metadata={
+                        "tool_name": tool_call.get("name"),
+                        "tool_call_count": state.tool_call_count,
+                    },
+                    trace_metadata=trace_metadata,
+                )
+            except Exception:
+                pass
+            return {"command": "execute_tool"}
 
-            # Case 3: Memory write already done or skipped
-            return {"command": "format"}
+        # ── Phase 4: Post-tool or no-tool memory/format routing ──────────────
+        # Case 1: Memory write authorized but not yet executed
+        if state.memory_write_authorized and state.memory_write_status is None:
+            return {"command": "memory_write"}
+
+        # Case 2: Memory write not yet authorized (authorize once)
+        if not state.memory_write_authorized:
+            return {
+                "command": "memory_write",
+                "memory_write_authorized": True,
+            }
+
+        # Case 3: Memory write done (or skipped) → format
+        return {"command": "format"}
 
     def _task_preprocessing_node(self, state: AgentState) -> Dict[str, Any]:
         """
@@ -378,11 +422,20 @@ class SAMAgentOrchestrator:
 
     def _model_call_node_impl(self, state: AgentState) -> Dict[str, Any]:
         """Model call node implementation (unwrapped)."""
+        # Build prompt (may include tool context for second call)
+        base_prompt = state.preprocessing_result or state.raw_input
+
+        # Phase E: Safe context injection (tool results as context, not prompt)
+        # Inject tool_context if available (bounded to 512 tokens ≈ 2048 chars)
+        context = None
+        if state.tool_context:
+            context = state.tool_context[: MCPGuardrails.MAX_TOTAL_CHARS * 2]  # 3000 char max
+
         # Build request
         request = ModelRequest(
             task="respond",
-            prompt=state.preprocessing_result or state.raw_input,
-            context=None,
+            prompt=base_prompt,
+            context=context,
             timeout_s=120,
             trace_id=state.trace_id,
         )
@@ -512,6 +565,185 @@ class SAMAgentOrchestrator:
         return response
 
     # ─────────────────────────────────────────────────────
+    # TOOL EXECUTION NODE (Phase MCP)
+    # ─────────────────────────────────────────────────────
+
+    def _tool_execution_node_wrapper(self, state: AgentState) -> Dict[str, Any]:
+        """
+        Wrap tool_execution_node with tracing.
+
+        Phase MCP: Executes tool requested by model, stores result,
+        clears model_response for re-call, formats tool_context.
+
+        Guardrails enforced:
+        - Max 1 tool call per turn
+        - Max 5 results, snippet ≤ 300 chars, budget ≤ 1500 chars
+        - Timeout fallback (no auto-retry)
+        - No memory mutation
+        """
+        trace_metadata = self._create_trace_metadata(state)
+
+        try:
+            self.tracer.record_event(
+                name="tool_execution_started",
+                metadata={
+                    "tool_call_count": state.tool_call_count,
+                    "tool_executed_before": state.tool_executed,
+                },
+                trace_metadata=trace_metadata,
+            )
+        except Exception:
+            pass
+
+        return self._wrap_node_execution(
+            "tool_execution_node", self._tool_execution_node_impl, state
+        )
+
+    def _tool_execution_node_impl(self, state: AgentState) -> Dict[str, Any]:
+        """
+        Tool execution node implementation (unwrapped).
+
+        Responsibilities:
+        1. Extract tool_call from model_response.metadata
+        2. Enforce guardrail: tool_call_count < MAX
+        3. Execute tool via ToolRegistry
+        4. Format results as tool_context (injection-safe)
+        5. Clear model_response for second model call
+        6. Set tool_executed = True, increment tool_call_count
+
+        Must NOT:
+        - Write to any memory_* field
+        - Change memory_write_authorized
+        - Set command (decision_logic_node authority)
+        - Override trace_id
+        """
+        trace_metadata = self._create_trace_metadata(state)
+
+        # Extract tool call from model response metadata
+        tool_call = (
+            state.model_response.metadata.get("tool_call")
+            if state.model_response and state.model_response.metadata
+            else None
+        )
+
+        if not tool_call:
+            # No tool call to execute — gracefully skip
+            try:
+                self.tracer.record_event(
+                    name="tool_execution_failed",
+                    metadata={"reason": "no_tool_call_in_metadata"},
+                    trace_metadata=trace_metadata,
+                )
+            except Exception:
+                pass
+            return {
+                "tool_executed": True,
+                "tool_call_count": state.tool_call_count + 1,
+                "model_response": None,  # Clear so decision routes to call_model
+            }
+
+        tool_name = tool_call.get("name", "")
+        tool_args = tool_call.get("arguments", {})
+
+        # Guardrail check (belt + suspenders — decision_logic already checks)
+        try:
+            MCPGuardrails.check_tool_call_limit(state.tool_call_count)
+        except GuardrailViolation as gv:
+            try:
+                self.tracer.record_event(
+                    name="tool_execution_failed",
+                    metadata={"reason": "guardrail_violation", "rule": gv.rule},
+                    trace_metadata=trace_metadata,
+                )
+            except Exception:
+                pass
+            # Skip tool, continue flow without tool context
+            return {
+                "tool_executed": True,
+                "tool_call_count": state.tool_call_count + 1,
+                "tool_result": {"error": str(gv)},
+                "model_response": None,
+            }
+
+        # Execute via ToolRegistry
+        tool_result_dict: Dict[str, Any] = {}
+        tool_context: Optional[str] = None
+
+        try:
+            from agent.intelligence.tools import get_tool_registry  # noqa: PLC0415
+            from agent.tools.web_search_tool import WebSearchTool    # noqa: PLC0415
+
+            registry = get_tool_registry()
+
+            # Register WebSearchTool with tracer if not yet registered
+            if registry.get("web_search") is None or not isinstance(
+                registry.get("web_search"), WebSearchTool
+            ):
+                registry.register(
+                    WebSearchTool(
+                        tracer=self.tracer,
+                        trace_metadata=trace_metadata,
+                    )
+                )
+
+            tool_result = registry.execute(tool_name, tool_args)
+            tool_result_dict = tool_result.model_dump()
+
+            if tool_result.success and tool_result.data.get("results"):
+                # Format bounded tool context for model injection
+                # Reconstruct BrowserBaseResult-like objects for formatter
+                from agent.mcp.external_client import BrowserBaseResult  # noqa: PLC0415
+
+                raw_results = tool_result.data["results"]
+                result_objects = [
+                    BrowserBaseResult(
+                        title=r.get("title", ""),
+                        url=r.get("url", ""),
+                        snippet=r.get("snippet", ""),
+                    )
+                    for r in raw_results
+                ]
+                tool_context = MCPGuardrails.format_tool_context(result_objects)
+
+            try:
+                self.tracer.record_event(
+                    name="tool_execution_completed",
+                    metadata={
+                        "tool_name": tool_name,
+                        "success": tool_result.success,
+                        "result_count": len(tool_result.data.get("results", [])),
+                        "execution_time_ms": tool_result.execution_time_ms,
+                    },
+                    trace_metadata=trace_metadata,
+                )
+            except Exception:
+                pass
+
+        except Exception as e:
+            try:
+                self.tracer.record_event(
+                    name="tool_execution_failed",
+                    metadata={"reason": "exception", "error": type(e).__name__},
+                    trace_metadata=trace_metadata,
+                )
+            except Exception:
+                pass
+            tool_result_dict = {"error": str(e)}
+
+        return {
+            # Tool execution state (Phase MCP)
+            "tool_executed": True,
+            "tool_call_count": state.tool_call_count + 1,
+            "tool_result": tool_result_dict,
+            "tool_context": tool_context,
+            # Clear model_response so decision_logic routes back to call_model
+            "model_response": None,
+            # Clear final_output so result_handling_node sets it fresh
+            "final_output": None,
+            # DO NOT touch memory_* fields
+        }
+
+    # ─────────────────────────────────────────────────────
     # MEMORY NODE WRAPPERS (WITH TRACING)
     # ─────────────────────────────────────────────────────
 
@@ -629,8 +861,8 @@ class SAMAgentOrchestrator:
             Response dict with conversation_id, trace_id, status, output, etc.
         """
         initial_state = AgentState(
-            conversation_id=conversation_id or "",
-            trace_id=trace_id or "",
+            conversation_id=conversation_id or str(uuid4()),
+            trace_id=trace_id or str(uuid4()),
             created_at="",
             input_type="text",
             raw_input=raw_input,
@@ -641,7 +873,15 @@ class SAMAgentOrchestrator:
 
         # Extract response from format_response_node output
         if isinstance(result, dict):
-            return result
+            # LangGraph returns the final state as a plain dict — map to standard shape
+            return {
+                "conversation_id": result.get("conversation_id", ""),
+                "trace_id": result.get("trace_id", ""),
+                "status": "success" if result.get("error_type") is None else "error",
+                "output": result.get("final_output"),
+                "error_type": result.get("error_type"),
+                "metadata": result.get("model_metadata") or {},
+            }
         elif isinstance(result, AgentState):
             # If result is state, manually format
             return {
