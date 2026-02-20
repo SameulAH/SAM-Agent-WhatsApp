@@ -10,7 +10,7 @@ Three providers available via Smithery (priority order: Exa → Brave → Linkup
   Linkup     linkup-search       Real-time facts, source-backed answers
 
 Authentication — Direct mode (simplest):
-  EXA_API_KEY      → https://exa.run.tools?exaApiKey=...
+  EXA_API_KEY      → https://mcp.exa.ai/mcp
   BRAVE_API_KEY    → https://brave.run.tools?braveApiKey=...
   LINKUP_API_KEY   → https://linkup-mcp-server--linkupplatform.run.tools?apiKey=...
 
@@ -97,7 +97,7 @@ class SearchProvider(str, Enum):
 # Static configuration per provider
 _PROVIDER_CONFIG: Dict[str, Dict] = {
     SearchProvider.EXA: {
-        "direct_url":  "https://exa.run.tools",
+        "direct_url":  "https://mcp.exa.ai/mcp",
         "query_param": "exaApiKey",
         "tool_name":   "web_search_exa",
         "args_fn":     lambda q, n: {"query": q, "numResults": n},
@@ -229,20 +229,37 @@ class MCPClient:
         if conn and self._namespace and self._smithery_key:
             return f"https://api.smithery.ai/connect/{self._namespace}/{conn}/mcp"
 
-        # Direct mode — API key as query param (no Smithery account needed)
+        # Direct mode — API key goes in Authorization header (Bearer token)
+        # run.tools endpoints no longer accept the key as a query parameter.
         if key:
-            return f"{cfg['direct_url']}?{urlencode({cfg['query_param']: key})}"
+            return cfg["direct_url"]
 
         return cfg["direct_url"]
 
     def _build_headers(self) -> dict:
-        """Auth headers. Provider keys stay in the URL, never in headers."""
+        """Auth headers for the active provider.
+
+        Priority:
+          1. Smithery Connect proxy  → Authorization: Bearer <smithery_key>
+          2. Exa direct (mcp.exa.ai) → x-api-key: <exa_key>
+          3. Other direct providers  → Authorization: Bearer <provider_api_key>
+        """
         headers = {
             "Content-Type": "application/json",
             "Accept": "application/json, text/event-stream",
         }
         if self._smithery_key:
             headers["Authorization"] = f"Bearer {self._smithery_key}"
+        elif self._provider == SearchProvider.EXA and self._exa_key:
+            # mcp.exa.ai uses x-api-key header (not Bearer)
+            headers["x-api-key"] = self._exa_key
+        elif self._provider is not None:
+            direct_key = {
+                SearchProvider.BRAVE:  self._brave_key,
+                SearchProvider.LINKUP: self._linkup_key,
+            }.get(self._provider, "")
+            if direct_key:
+                headers["Authorization"] = f"Bearer {direct_key}"
         return headers
 
     def _credentials_present(self) -> bool:
@@ -524,7 +541,13 @@ class MCPClient:
             if parsed is not None:
                 return parsed[:max_results]
 
-            # Plain-text fallback (non-JSON response)
+            # mcp.exa.ai plain-text format:
+            #   Title: ...\nPublished Date: ...\nURL: ...\nText: ...\n\n
+            exa_parsed = self._try_parse_exa_text_results(text, max_results)
+            if exa_parsed:
+                return exa_parsed
+
+            # Generic plain-text fallback (last resort)
             return [BrowserBaseResult(
                 title="Search Result",
                 url="",
@@ -532,6 +555,47 @@ class MCPClient:
             )]
 
         return []
+
+    @staticmethod
+    def _try_parse_exa_text_results(
+        text: str,
+        max_results: int,
+    ) -> List[BrowserBaseResult]:
+        """
+        Parse the plain-text format returned by mcp.exa.ai/mcp:
+
+            Title: <title>
+            Published Date: <date>
+            URL: <url>
+            Text: <body text>
+
+        Multiple results are separated by blank lines or by the next 'Title:' block.
+        """
+        import re as _re
+        results: List[BrowserBaseResult] = []
+
+        # Split on double newlines or on lines that start a new Title: block
+        blocks = _re.split(r'\n(?=Title:)', text.strip())
+
+        for block in blocks:
+            if not block.strip():
+                continue
+            title_m = _re.search(r'^Title:\s*(.+)', block, _re.MULTILINE)
+            url_m   = _re.search(r'^URL:\s*(https?://\S+)', block, _re.MULTILINE)
+            text_m  = _re.search(r'^Text:\s*(.+)', block, _re.MULTILINE | _re.DOTALL)
+
+            if not title_m:
+                continue
+
+            title   = title_m.group(1).strip()
+            url     = url_m.group(1).strip() if url_m else ""
+            snippet = text_m.group(1).strip()[:MCPGuardrails.MAX_SNIPPET_LEN] if text_m else ""
+
+            results.append(BrowserBaseResult(title=title, url=url, snippet=snippet))
+            if len(results) >= max_results:
+                break
+
+        return results
 
     @staticmethod
     def _try_parse_json_results(

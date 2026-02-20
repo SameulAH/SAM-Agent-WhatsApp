@@ -1021,6 +1021,15 @@ class SAMAgentOrchestrator:
                 ]
                 tool_context = MCPGuardrails.format_tool_context(result_objects)
 
+            # Fallback: if tool returned no usable results, give model a notice
+            # so it answers from training knowledge rather than repeating the tool call
+            if not tool_context:
+                tool_context = (
+                    "Note: The web search did not return usable results. "
+                    "Please answer based on your training knowledge and state that "
+                    "you could not retrieve live results."
+                )
+
             try:
                 self.tracer.record_event(
                     name="tool_execution_completed",
@@ -1045,6 +1054,10 @@ class SAMAgentOrchestrator:
             except Exception:
                 pass
             tool_result_dict = {"error": str(e)}
+            tool_context = (
+                "Note: The web search encountered an error and could not retrieve results. "
+                "Please answer based on your training knowledge."
+            )
 
         return {
             # Tool execution state (Phase MCP)

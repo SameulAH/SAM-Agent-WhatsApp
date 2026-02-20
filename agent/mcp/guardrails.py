@@ -46,7 +46,7 @@ class MCPGuardrails:
     MAX_RESULTS: int = 5
     MAX_SNIPPET_LEN: int = 300
     MAX_TOTAL_CHARS: int = 1500
-    MCP_TIMEOUT_S: float = 5.0
+    MCP_TIMEOUT_S: float = 15.0   # mcp.exa.ai live-crawl can take 8-12 s
 
     @classmethod
     def check_tool_call_limit(cls, tool_call_count: int) -> None:
