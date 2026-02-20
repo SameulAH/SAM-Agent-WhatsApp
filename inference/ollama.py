@@ -37,8 +37,63 @@ TOOL USAGE RULES:
 - If you do NOT need a tool, respond normally without any [TOOL_CALL] marker.
 """
 
-# Regex to extract [TOOL_CALL]{...} from model output
-_TOOL_CALL_RE = re.compile(r"\[TOOL_CALL\]\s*(\{.*?\})", re.DOTALL)
+# Regex to locate the [TOOL_CALL] marker (case-insensitive for robustness)
+_TOOL_CALL_MARKER_RE = re.compile(r"\[TOOL_CALL\]", re.IGNORECASE)
+# Fallback: pull the query field out of truncated JSON.
+# The closing quote is optional so truncated values like "define got your messa)
+# (missing the closing ") are still captured.
+_QUERY_FALLBACK_RE = re.compile(r'"query"\s*:\s*"([^"]*)"?')
+
+
+def _extract_tool_call(output: str):
+    """
+    Find [TOOL_CALL]{...} in model output using brace-counting.
+
+    The old single-regex approach ({.*?}) stops at the FIRST closing brace,
+    which is the inner 'arguments' object — producing invalid JSON every time.
+    Brace-counting correctly handles nested objects.
+
+    Returns:
+        (tool_call_dict, cleaned_output) on success
+        (None,           cleaned_output) if marker found but JSON unrecoverable
+        (None,           original_output) if no marker at all
+    """
+    marker = _TOOL_CALL_MARKER_RE.search(output)
+    if not marker:
+        return None, output
+
+    # Always strip [TOOL_CALL] and everything after it from the visible output
+    clean = output[: marker.start()].strip()
+
+    brace_start = output.find("{", marker.end())
+    if brace_start == -1:
+        return None, clean  # marker present but no JSON body
+
+    # Walk forward counting braces to find the matching close
+    depth = 0
+    brace_end = -1
+    for i, ch in enumerate(output[brace_start:], brace_start):
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                brace_end = i + 1
+                break
+
+    json_str = output[brace_start:brace_end] if brace_end != -1 else output[brace_start:]
+
+    try:
+        return json.loads(json_str), clean
+    except json.JSONDecodeError:
+        # Truncated / malformed JSON — try to at least salvage the query string
+        q = _QUERY_FALLBACK_RE.search(json_str)
+        if q:
+            return {
+                "name": "web_search",
+                "arguments": {"query": q.group(1)},
+            }, clean
+        return None, clean  # nothing usable, but marker is still hidden from user
 
 
 class OllamaModelBackend(ModelBackend):
@@ -120,15 +175,9 @@ class OllamaModelBackend(ModelBackend):
 
             # ── Parse [TOOL_CALL] marker ────────────────────────────────────
             metadata = dict(base_metadata)
-            match = _TOOL_CALL_RE.search(output)
-            if match:
-                try:
-                    tool_call_data = json.loads(match.group(1))
-                    metadata["tool_call"] = tool_call_data
-                    # Remove the raw marker from the visible output
-                    output = _TOOL_CALL_RE.sub("", output).strip()
-                except json.JSONDecodeError:
-                    pass  # Malformed JSON — treat as plain text, no tool call
+            tool_call_data, output = _extract_tool_call(output)
+            if tool_call_data:
+                metadata["tool_call"] = tool_call_data
 
             return ModelResponse(
                 status="success",
