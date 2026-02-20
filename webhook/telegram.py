@@ -16,6 +16,7 @@ import logging
 from typing import Dict, Optional, Any
 from datetime import datetime
 
+from cachetools import TTLCache
 from pydantic import BaseModel, Field
 from fastapi import APIRouter, HTTPException, Request, BackgroundTasks
 
@@ -30,6 +31,10 @@ logger = logging.getLogger(__name__)
 
 # Create router
 router = APIRouter(prefix="/webhook", tags=["webhook"])
+
+# TTL cache for update_id deduplication — 5-minute window, max 5 000 entries.
+# Prevents duplicate processing when Telegram retries a slow webhook.
+_processed_updates: TTLCache = TTLCache(maxsize=5000, ttl=300)
 
 # Telegram update structure
 class TelegramUser(BaseModel):
@@ -88,97 +93,121 @@ def get_telegram_transport():
 async def telegram_webhook(update: TelegramUpdate, background_tasks: BackgroundTasks):
     """
     Receive Telegram webhook updates.
-    
-    Handles both text and voice messages.
-    Voice messages are forwarded to the voice handler.
-    
-    Expected payload:
-    {
-        "update_id": 123456789,
-        "message": {
-            "message_id": 1,
-            "date": 1676817600,
-            "chat": {"id": -123456789, "type": "private"},
-            "from": {"id": 987654321, "first_name": "User"},
-            "text": "Hello bot!"
-        }
-    }
-    
-    Returns:
-        {"status": "ok"} if processed successfully
-        Or error response if processing fails
+
+    Idempotency guarantee: updates with a previously-seen update_id are
+    silently acknowledged (HTTP 200) without any processing so that Telegram
+    retries never produce duplicate messages.
+
+    Heavy work (STT, agent.invoke, TTS) is offloaded to a BackgroundTask so
+    the handler returns HTTP 200 in milliseconds — well inside Telegram's
+    10-second timeout.
     """
+    # ── 1. Deduplication ──────────────────────────────────────────────────────
+    if update.update_id in _processed_updates:
+        logger.debug(f"Ignoring duplicate update_id={update.update_id}")
+        return {"status": "ok"}
+    _processed_updates[update.update_id] = True
+    logger.info(f"Processing update_id={update.update_id}")
+
     try:
-        # Validate we have a message
+        # ── 2. Validate payload ───────────────────────────────────────────────
         if not update.message:
             logger.warning(f"Update {update.update_id} has no message")
-            return {"status": "ok"}  # Still return 200 to Telegram
-        
+            return {"status": "ok"}
+
         msg = update.message
-        
-        # Check for voice message - forward to voice handler
+
+        # ── 3. Route voice messages to the voice handler ──────────────────────
         if msg.voice:
             from webhook.telegram_voice import handle_voice_message
-            logger.info(f"Voice message detected, forwarding to voice handler")
+            logger.info("Voice message detected, forwarding to voice handler")
             return await handle_voice_message(update, background_tasks)
-        
-        # Only handle text messages
+
+        # ── 4. Skip non-text messages ─────────────────────────────────────────
         if not msg.text:
             logger.debug(f"Message {msg.message_id} has no text or voice, skipping")
             return {"status": "ok"}
-        
-        # Log received message
+
         logger.info(
-            f"Received message from {msg.from_.username or msg.from_.first_name}: {msg.text[:50]}"
+            f"Received message from {msg.from_.username or msg.from_.first_name}: "
+            f"{msg.text[:50]}"
         )
-        
-        # Get transport
-        transport = get_telegram_transport()
-        
-        # Create normalized message
+
+        # ── 5. Offload to background — return 200 immediately ─────────────────
+        background_tasks.add_task(
+            _process_text_async,
+            chat_id=msg.chat.id,
+            user_id=msg.from_.id,
+            text=msg.text,
+            user_name=msg.from_.username or msg.from_.first_name,
+            timestamp=datetime.fromtimestamp(msg.date),
+        )
+        return {"status": "ok"}
+
+    except Exception as e:
+        logger.error(f"Error handling Telegram update: {str(e)}", exc_info=True)
+        return {"status": "ok"}  # Always 200 so Telegram stops retrying
+
+
+async def _process_text_async(
+    chat_id: int,
+    user_id: int,
+    text: str,
+    user_name: str,
+    timestamp: datetime,
+) -> None:
+    """
+    Background task: run agent pipeline and send the reply for a text message.
+
+    Runs *after* the webhook handler has already returned HTTP 200, so any
+    latency here (LLM, tool calls, TTS) never risks a Telegram retry.
+    """
+    from webhook.telegram_voice import clean_agent_response, text_to_ogg_voice
+
+    transport = get_telegram_transport()
+
+    try:
         normalized = NormalizedMessage(
             platform="telegram",
-            user_id=str(msg.from_.id),
-            chat_id=str(msg.chat.id),
-            content=msg.text,
-            timestamp=datetime.fromtimestamp(msg.date),
-            user_name=msg.from_.username or msg.from_.first_name,
+            user_id=str(user_id),
+            chat_id=str(chat_id),
+            content=text,
+            timestamp=timestamp,
+            user_name=user_name,
         )
-        
-        # Process through agent
+
         response_text = await process_message_through_agent(normalized)
 
-        # Clean chain-of-thought from response
         if response_text:
-            from webhook.telegram_voice import clean_agent_response, text_to_ogg_voice
             response_text = clean_agent_response(response_text)
 
-        # Send response back — voice if > 5 lines, else text
-        if response_text:
-            lines = [l for l in response_text.splitlines() if l.strip()]
-            if len(lines) > 5:
-                # Long reply → send as voice message
-                from webhook.telegram_voice import get_voice_transport
-                import asyncio
-                loop = asyncio.get_event_loop()
-                ogg_bytes = await loop.run_in_executor(None, text_to_ogg_voice, response_text)
-                voice_transport = get_voice_transport()
-                if ogg_bytes:
-                    await voice_transport.send_voice_message(msg.chat.id, ogg_bytes)
-                    logger.info(f"Sent long voice reply to chat {msg.chat.id}")
-                else:
-                    transport.send_response(msg.chat.id, response_text)
-            else:
-                transport.send_response(msg.chat.id, response_text)
-                logger.info(f"Sent text reply to chat {msg.chat.id}")
-        
-        return {"status": "ok"}
-    
+        if not response_text:
+            response_text = "Sorry, I couldn't process that."
+
+        # Long replies → send as voice message; short replies → send as text
+        lines = [l for l in response_text.splitlines() if l.strip()]
+        if len(lines) > 5:
+            import asyncio
+            loop = asyncio.get_event_loop()
+            ogg_bytes = await loop.run_in_executor(None, text_to_ogg_voice, response_text)
+            from webhook.telegram_voice import get_voice_transport
+            voice_transport = get_voice_transport()
+            if ogg_bytes:
+                await voice_transport.send_voice_message(chat_id, ogg_bytes)
+                logger.info(f"Sent long voice reply to chat {chat_id}")
+                return
+            # TTS failed — fall through to plain text
+
+        transport.send_response(chat_id, response_text)
+        logger.info(f"Sent text reply to chat {chat_id}")
+
     except Exception as e:
-        logger.error(f"Error processing Telegram update: {str(e)}", exc_info=True)
-        # Still return 200 to Telegram to acknowledge receipt
-        # (Telegram will retry if we return error)
-        return {"status": "ok"}
+        logger.error(f"Text processing failed for chat {chat_id}: {e}", exc_info=True)
+        try:
+            transport.send_response(chat_id, "Sorry, something went wrong.")
+        except Exception:
+            pass
+
 
 
 @router.get("/telegram/health")

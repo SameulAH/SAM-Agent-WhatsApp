@@ -110,7 +110,6 @@ def _get_tts_backend():
         if _tts_backend is None:  # double-checked locking
             from services.tts.coqui import CoquiTTSBackend
             import os
-            global _tts_backend
             _tts_backend = CoquiTTSBackend(
                 language=os.getenv("XTTS_LANGUAGE", "en"),
             )
@@ -688,6 +687,7 @@ async def _process_voice_async(
 
             # Fallback: send as text
             await transport.send_message(chat_id, response_msg)
+            return  # prevent fall-through to the outer send_message call
 
         elif result.status == "success" and not result.transcribed_text:
             response_msg = "⚠️ Transcription succeeded but no text was detected"

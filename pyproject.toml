@@ -23,7 +23,9 @@ dependencies = [
   "openai-whisper>=20230314",
   "TTS>=0.22.0",
   "fastapi>=0.104.0",
-  "uvicorn>=0.24.0"
+  "uvicorn>=0.24.0",
+  "cachetools>=5.3",
+  "types-cachetools>=5.3"
 ]
 [project.optional-dependencies]
 dev = [
@@ -55,6 +57,7 @@ line_length = 100
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
+pythonpath = ["."]
 addopts = "--cov=sam_agent --cov-report=html --cov-report=term-missing"
 
 [tool.mypy]
