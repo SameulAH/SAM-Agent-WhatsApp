@@ -9,7 +9,10 @@ Features:
 - 17 languages, multilingual in a single model
 - Voice cloning: pass a ≥6-second WAV speaker sample via XTTS_SPEAKER_WAV
 - Built-in speaker fallback when no sample is provided ("Ana Florence")
-- Lazy model loading (first call only; ~1-2 GB download on first run)
+- Process-global model cache: the TTS object is loaded once and reused
+  across all CoquiTTSBackend instances for the same (model, device) pair.
+  A threading.Lock serialises the first load so concurrent callers do not
+  each trigger a full model reload.
 
 Environment variables:
   XTTS_SPEAKER_WAV  Path to a WAV file used for voice cloning (optional)
@@ -19,7 +22,8 @@ Environment variables:
 import os
 import tempfile
 import subprocess
-from typing import Optional
+import threading
+from typing import Dict, Optional, Tuple
 from .base import TTSBackend, TTSRequest, TTSResponse
 
 try:
@@ -32,6 +36,13 @@ except ImportError:
 _XTTS_V2_MODEL = "tts_models/multilingual/multi-dataset/xtts_v2"
 # Built-in speaker used when no WAV sample is supplied
 _DEFAULT_SPEAKER = "Ana Florence"
+
+# ── Process-global model cache ────────────────────────────────────────────────
+# Keyed by (model_name, device).  Populated on the first synthesis call.
+# Subsequent calls — and any new CoquiTTSBackend instances — reuse the same
+# TTS object without loading the model again (~1.8 GB saved every call).
+_MODEL_CACHE: Dict[Tuple[str, str], "TTS"] = {}
+_MODEL_LOCK = threading.Lock()
 
 
 class CoquiTTSBackend(TTSBackend):
@@ -78,18 +89,33 @@ class CoquiTTSBackend(TTSBackend):
             or os.getenv("XTTS_SPEAKER_WAV")
             or None
         )
-        self._model: Optional[TTS] = None
+        # _model is a property that reads from the process-global cache;
+        # no per-instance storage needed.
 
     # ── Private helpers ────────────────────────────────────────────────────
 
-    def _load_model(self) -> None:
-        """Lazy-load XTTS v2 on the first synthesis call."""
-        if self._model is None:
-            self._model = TTS(
-                model_name=self.model_name,
-                gpu=(self.device == "cuda"),
-                progress_bar=False,
-            )
+    def _load_model(self) -> "TTS":
+        """
+        Return the TTS model for this (model_name, device) pair.
+
+        Uses the process-global _MODEL_CACHE so the 1.8 GB model is loaded
+        exactly once per process, regardless of how many CoquiTTSBackend
+        instances are created.  A threading.Lock prevents duplicate loads
+        when concurrent requests race to call synthesize() for the first time.
+        """
+        key = (self.model_name, self.device)
+        # Fast path — cache already populated (no lock needed after first load)
+        if key in _MODEL_CACHE:
+            return _MODEL_CACHE[key]
+        # Slow path — first load; serialise with lock
+        with _MODEL_LOCK:
+            if key not in _MODEL_CACHE:  # double-checked locking
+                _MODEL_CACHE[key] = TTS(
+                    model_name=self.model_name,
+                    gpu=(self.device == "cuda"),
+                    progress_bar=False,
+                )
+        return _MODEL_CACHE[key]
 
     def _wav_to_ogg(self, wav_path: str) -> bytes:
         """
@@ -137,7 +163,7 @@ class CoquiTTSBackend(TTSBackend):
             )
 
         try:
-            self._load_model()
+            model = self._load_model()
 
             language = request.language or self.language
 
@@ -146,7 +172,7 @@ class CoquiTTSBackend(TTSBackend):
 
                 if self.speaker_wav and os.path.isfile(self.speaker_wav):
                     # Voice-cloning mode
-                    self._model.tts_to_file(
+                    model.tts_to_file(
                         text=request.text,
                         file_path=wav_path,
                         speaker_wav=self.speaker_wav,
@@ -154,7 +180,7 @@ class CoquiTTSBackend(TTSBackend):
                     )
                 else:
                     # Built-in speaker mode
-                    self._model.tts_to_file(
+                    model.tts_to_file(
                         text=request.text,
                         file_path=wav_path,
                         speaker=_DEFAULT_SPEAKER,

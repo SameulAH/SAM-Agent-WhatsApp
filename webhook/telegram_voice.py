@@ -85,12 +85,46 @@ def clean_agent_response(text: str) -> str:
     return text.strip()
 
 
+# ── Module-level TTS singleton ─────────────────────────────────────────────────
+# The CoquiTTSBackend instance is created once per process so the underlying
+# TTS model object (already cached in services/tts/coqui._MODEL_CACHE) is
+# never unnecessarily re-wrapped, and environment-variable resolution
+# (XTTS_SPEAKER_WAV, XTTS_LANGUAGE) happens only once at startup.
+_tts_backend = None
+_tts_backend_lock = None  # initialised lazily to avoid import-time threading overhead
+
+
+def _get_tts_backend():
+    """Return the process-global CoquiTTSBackend, creating it on first call."""
+    import threading
+    global _tts_backend, _tts_backend_lock
+
+    # Initialise the lock itself exactly once (module load is single-threaded)
+    if _tts_backend_lock is None:
+        _tts_backend_lock = threading.Lock()
+
+    if _tts_backend is not None:
+        return _tts_backend
+
+    with _tts_backend_lock:
+        if _tts_backend is None:  # double-checked locking
+            from services.tts.coqui import CoquiTTSBackend
+            import os
+            global _tts_backend
+            _tts_backend = CoquiTTSBackend(
+                language=os.getenv("XTTS_LANGUAGE", "en"),
+            )
+
+    return _tts_backend
+
+
 def text_to_ogg_voice(text: str, lang: str = "en") -> Optional[bytes]:
     """
     Convert text to OGG Opus audio using Coqui XTTS v2.
 
-    XTTS v2 produces high-quality neural speech locally — no internet
-    connection required after the first model download.
+    The CoquiTTSBackend instance and the underlying TTS model are both kept
+    in memory after the first call, eliminating model-reload latency on
+    subsequent voice messages.
 
     Voice cloning: set XTTS_SPEAKER_WAV to a ≥6-second WAV sample path.
     Language:      set XTTS_LANGUAGE (default "en").
@@ -98,7 +132,7 @@ def text_to_ogg_voice(text: str, lang: str = "en") -> Optional[bytes]:
     Returns raw OGG Opus bytes, or None if synthesis fails.
     """
     try:
-        from services.tts.coqui import CoquiTTSBackend, COQUI_AVAILABLE
+        from services.tts.coqui import COQUI_AVAILABLE
         from services.tts.base import TTSRequest
         import os
 
@@ -107,7 +141,7 @@ def text_to_ogg_voice(text: str, lang: str = "en") -> Optional[bytes]:
             return None
 
         language = os.getenv("XTTS_LANGUAGE", lang)
-        backend = CoquiTTSBackend(language=language)
+        backend = _get_tts_backend()
         request = TTSRequest(text=text, language=language)
         response = backend.synthesize(request)
 
