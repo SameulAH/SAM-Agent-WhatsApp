@@ -41,6 +41,8 @@ class InfraConfig:
     tts_backend: TTSBackendType
     coqui_model: str
     coqui_device: str
+    xtts_speaker_wav: Optional[str]   # path to WAV for voice cloning (optional)
+    xtts_language: str                 # BCP-47 language code
     
     # LTM
     ltm_backend: LTMBackendType
@@ -73,8 +75,10 @@ class InfraConfig:
             # TTS Configuration
             tts_enabled=os.getenv("TTS_ENABLED", "true").lower() == "true",
             tts_backend=os.getenv("TTS_BACKEND", "coqui"),  # type: ignore
-            coqui_model=os.getenv("COQUI_MODEL", "tts_models/en/ljspeech/glow-tts"),
+            coqui_model=os.getenv("COQUI_MODEL", "tts_models/multilingual/multi-dataset/xtts_v2"),
             coqui_device=os.getenv("COQUI_DEVICE", "cpu"),
+            xtts_speaker_wav=os.getenv("XTTS_SPEAKER_WAV") or None,
+            xtts_language=os.getenv("XTTS_LANGUAGE", "en"),
             
             # LTM Configuration
             ltm_backend=os.getenv("LTM_BACKEND", "qdrant"),  # type: ignore
@@ -127,7 +131,9 @@ class InfraConfig:
             try:
                 return CoquiTTSBackend(
                     model_name=self.coqui_model,
-                    device=self.coqui_device
+                    device=self.coqui_device,
+                    speaker_wav=self.xtts_speaker_wav,
+                    language=self.xtts_language,
                 )
             except ImportError:
                 # Coqui not installed, fall back to stub

@@ -60,8 +60,10 @@ services:
       # TTS Configuration (optional)
       TTS_ENABLED: ${TTS_ENABLED:-false}
       TTS_BACKEND: ${TTS_BACKEND:-coqui}
-      COQUI_MODEL: ${COQUI_MODEL:-tts_models/en/ljspeech/glow-tts}
+      COQUI_MODEL: ${COQUI_MODEL:-tts_models/multilingual/multi-dataset/xtts_v2}
       COQUI_DEVICE: ${COQUI_DEVICE:-cpu}
+      XTTS_SPEAKER_WAV: ${XTTS_SPEAKER_WAV:-}
+      XTTS_LANGUAGE: ${XTTS_LANGUAGE:-en}
       
       # Short-term Memory Backend
       STM_BACKEND: ${STM_BACKEND:-sqlite}

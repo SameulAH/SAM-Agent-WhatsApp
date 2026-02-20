@@ -87,41 +87,35 @@ def clean_agent_response(text: str) -> str:
 
 def text_to_ogg_voice(text: str, lang: str = "en") -> Optional[bytes]:
     """
-    Convert text to OGG Opus audio using gTTS + ffmpeg.
+    Convert text to OGG Opus audio using Coqui XTTS v2.
 
-    Returns raw OGG bytes, or None if synthesis fails.
+    XTTS v2 produces high-quality neural speech locally — no internet
+    connection required after the first model download.
+
+    Voice cloning: set XTTS_SPEAKER_WAV to a ≥6-second WAV sample path.
+    Language:      set XTTS_LANGUAGE (default "en").
+
+    Returns raw OGG Opus bytes, or None if synthesis fails.
     """
-    import tempfile
-    import os
-    import subprocess
-
     try:
-        from gtts import gTTS
-    except ImportError:
-        logger.warning("gTTS not installed, cannot synthesize voice")
+        from services.tts.coqui import CoquiTTSBackend, COQUI_AVAILABLE
+        from services.tts.base import TTSRequest
+        import os
+
+        if not COQUI_AVAILABLE:
+            logger.warning("Coqui TTS (package 'TTS') not installed — cannot synthesize voice")
+            return None
+
+        language = os.getenv("XTTS_LANGUAGE", lang)
+        backend = CoquiTTSBackend(language=language)
+        request = TTSRequest(text=text, language=language)
+        response = backend.synthesize(request)
+
+        if response.status == "success" and response.audio_data:
+            return response.audio_data
+
+        logger.warning(f"XTTS v2 synthesis failed: {response.error_type}")
         return None
-
-    try:
-        # Generate MP3 from text
-        tts = gTTS(text=text, lang=lang, slow=False)
-        tmp_mp3 = tempfile.NamedTemporaryFile(suffix=".mp3", delete=False)
-        tts.save(tmp_mp3.name)
-        tmp_mp3.close()
-
-        # Convert MP3 → OGG Opus with ffmpeg
-        tmp_ogg_path = tmp_mp3.name.replace(".mp3", ".ogg")
-        try:
-            subprocess.run(
-                ["ffmpeg", "-y", "-i", tmp_mp3.name,
-                 "-c:a", "libopus", "-b:a", "32k", tmp_ogg_path],
-                check=True, capture_output=True,
-            )
-            with open(tmp_ogg_path, "rb") as f:
-                return f.read()
-        finally:
-            os.unlink(tmp_mp3.name)
-            if os.path.exists(tmp_ogg_path):
-                os.unlink(tmp_ogg_path)
 
     except Exception as e:
         logger.error(f"TTS synthesis failed: {e}", exc_info=True)
