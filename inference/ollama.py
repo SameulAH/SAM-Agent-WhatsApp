@@ -70,6 +70,86 @@ def _extract_tool_call(output: str):
         return None, clean  # nothing usable, but marker is still hidden from user
 
 
+def _try_loose_tool_call(output: str):
+    """
+    Fallback tool-call detection for models that don't use [TOOL_CALL] marker.
+
+    Handles:
+      • {"name": "web_search", "arguments": {"query": "…"}}  — raw structured JSON
+      • web_search{"query": "…"}                              — loose function syntax
+      • web_search({"query": "…"})                           — function-call style
+
+    Returns:
+        (tool_call_dict, cleaned_output) on success
+        (None,           original_output) if no pattern found
+    """
+    if not output or not output.strip():
+        return None, output
+
+    # ── Strategy 1: raw structured JSON {"name": "...", "arguments": {...}} ──
+    m = re.search(
+        r'\{\s*"name"\s*:\s*"([\w_]+)"\s*,\s*"arguments"\s*:\s*(\{)',
+        output,
+    )
+    if m:
+        tool_name = m.group(1)
+        brace_pos = m.start(2)
+        depth = 0
+        brace_end = -1
+        for i, ch in enumerate(output[brace_pos:], brace_pos):
+            if ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    brace_end = i + 1
+                    break
+        if brace_end != -1:
+            try:
+                args = json.loads(output[brace_pos:brace_end])
+                return {"name": tool_name, "arguments": args}, ""
+            except json.JSONDecodeError:
+                pass
+
+    # ── Strategy 2: loose syntax — known_tool{...} or known_tool({...}) ──────
+    for tool_name in ("web_search",):
+        pattern = re.compile(
+            rf"\b{re.escape(tool_name)}\s*\(?\s*(\{{)",
+            re.IGNORECASE,
+        )
+        m = pattern.search(output)
+        if m:
+            brace_pos = m.start(1)
+            depth = 0
+            brace_end = -1
+            for i, ch in enumerate(output[brace_pos:], brace_pos):
+                if ch == "{":
+                    depth += 1
+                elif ch == "}":
+                    depth -= 1
+                    if depth == 0:
+                        brace_end = i + 1
+                        break
+            if brace_end != -1:
+                json_str = output[brace_pos:brace_end]
+                try:
+                    args = json.loads(json_str)
+                    # Normalise: {"arguments": {...}} → unwrap
+                    if "arguments" in args:
+                        args = args["arguments"]
+                    return {"name": tool_name, "arguments": args}, ""
+                except json.JSONDecodeError:
+                    # Salvage query string from malformed JSON
+                    qm = re.search(r'"query"\s*:\s*"([^"]*)"', json_str)
+                    if qm:
+                        return {
+                            "name": tool_name,
+                            "arguments": {"query": qm.group(1)},
+                        }, ""
+
+    return None, output
+
+
 class OllamaModelBackend(ModelBackend):
     """
     Ollama backend for local model inference.
@@ -150,6 +230,9 @@ class OllamaModelBackend(ModelBackend):
             # ── Parse [TOOL_CALL] marker ────────────────────────────────────
             metadata = dict(base_metadata)
             tool_call_data, output = _extract_tool_call(output)
+            # Fallback: detect loose patterns if [TOOL_CALL] marker was not used
+            if not tool_call_data:
+                tool_call_data, output = _try_loose_tool_call(output)
             if tool_call_data:
                 metadata["tool_call"] = tool_call_data
 

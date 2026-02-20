@@ -17,6 +17,8 @@ Phase MCP: Added tool_execution_node and execute_tool routing.
 from typing import Any, Dict, Optional
 from datetime import datetime
 from uuid import uuid4
+import json
+import re
 import time
 
 from langgraph.graph import StateGraph
@@ -131,12 +133,13 @@ class SAMAgentOrchestrator:
         graph.add_edge("long_term_memory_read_node", "decision_logic_node")  # Phase 3.2
         graph.add_edge("tool_execution_node", "decision_logic_node")  # Phase MCP
         
-        # model_call_node branches on success/failure
+        # model_call_node branches on success / tool-detected / failure
         graph.add_conditional_edges(
             "model_call_node",
             self._route_from_model_call,
             {
                 "success": "result_handling_node",
+                "execute_tool": "tool_execution_node",  # Short-circuit: bypass result_handling
                 "failure": "error_router_node",
             }
         )
@@ -173,11 +176,20 @@ class SAMAgentOrchestrator:
             return "format"
 
     def _route_from_model_call(self, state: AgentState) -> str:
-        """Route based on model response status."""
+        """Route based on model response status.
+
+        Three routes:
+          • "execute_tool" — tool_call detected by _model_call_node_impl → skip
+                             result_handling_node, go directly to tool_execution_node
+          • "success"      — clean text response → result_handling_node
+          • "failure"      — error response → error_router_node
+        """
+        # Short-circuit: tool_call detected, bypass result_handling entirely
+        if state.command == "execute_tool":
+            return "execute_tool"
         if state.model_response and state.model_response.status == "success":
             return "success"
-        else:
-            return "failure"
+        return "failure"
 
     def _create_trace_metadata(self, state: AgentState) -> TraceMetadata:
         """Extract trace metadata from state."""
@@ -243,6 +255,93 @@ class SAMAgentOrchestrator:
 
             # Re-raise the exception (node failure propagates)
             raise
+
+    # ─────────────────────────────────────────────────────
+    # TOOL CALL PARSER (static, backend-agnostic)
+    # ─────────────────────────────────────────────────────
+
+    @staticmethod
+    def _try_parse_tool_call(output: str) -> Optional[Dict[str, Any]]:
+        """
+        Secondary parser for tool calls that don't use the [TOOL_CALL] marker.
+
+        The primary parser lives in OllamaModelBackend._extract_tool_call and handles
+        the [TOOL_CALL]{...} format.  This method is called by _model_call_node_impl
+        as a fallback when metadata["tool_call"] is not already set, covering models
+        (e.g. qwen2.5:7b) that emit tool syntax in other formats:
+
+          • {"name": "web_search", "arguments": {"query": "…"}}  — raw JSON
+          • web_search{"query": "…"}                              — loose syntax
+          • web_search({"query": "…"})                           — function-call style
+
+        Uses brace-counting for correctness (mirrors primary parser).
+
+        Returns:
+            Normalised {"name": "...", "arguments": {...}} dict, or None.
+        """
+        if not output or not output.strip():
+            return None
+
+        # ── Strategy 1: raw structured JSON {"name": "...", "arguments": {...}} ──
+        m = re.search(
+            r'\{\s*"name"\s*:\s*"([\w_]+)"\s*,\s*"arguments"\s*:\s*(\{)',
+            output,
+        )
+        if m:
+            tool_name = m.group(1)
+            brace_pos = m.start(2)
+            depth = 0
+            brace_end = -1
+            for i, ch in enumerate(output[brace_pos:], brace_pos):
+                if ch == "{":
+                    depth += 1
+                elif ch == "}":
+                    depth -= 1
+                    if depth == 0:
+                        brace_end = i + 1
+                        break
+            if brace_end != -1:
+                try:
+                    args = json.loads(output[brace_pos:brace_end])
+                    return {"name": tool_name, "arguments": args}
+                except json.JSONDecodeError:
+                    pass
+
+        # ── Strategy 2: loose syntax — known_tool{...} or known_tool({...}) ──
+        for tool_name in ("web_search",):
+            pattern = re.compile(
+                rf"\b{re.escape(tool_name)}\s*\(?\s*(\{{)",
+                re.IGNORECASE,
+            )
+            m = pattern.search(output)
+            if m:
+                brace_pos = m.start(1)
+                depth = 0
+                brace_end = -1
+                for i, ch in enumerate(output[brace_pos:], brace_pos):
+                    if ch == "{":
+                        depth += 1
+                    elif ch == "}":
+                        depth -= 1
+                        if depth == 0:
+                            brace_end = i + 1
+                            break
+                if brace_end != -1:
+                    json_str = output[brace_pos:brace_end]
+                    try:
+                        args = json.loads(json_str)
+                        if "arguments" in args:
+                            args = args["arguments"]
+                        return {"name": tool_name, "arguments": args}
+                    except json.JSONDecodeError:
+                        qm = re.search(r'"query"\s*:\s*"([^"]*)"', json_str)
+                        if qm:
+                            return {
+                                "name": tool_name,
+                                "arguments": {"query": qm.group(1)},
+                            }
+
+        return None
 
     # ─────────────────────────────────────────────────────
     # NODE IMPLEMENTATIONS
@@ -354,10 +453,11 @@ class SAMAgentOrchestrator:
             else None
         )
 
-        # Phase MCP: Route to tool execution if:
-        # 1. Model emitted a tool_call
-        # 2. Tool not yet executed this turn (prevents loops)
-        # 3. Guardrail: tool_call_count < MAX (1 per turn)
+        # Phase MCP: Safety-net routing for tool execution.
+        # Primary path: _model_call_node_impl sets command="execute_tool" and
+        # _route_from_model_call short-circuits directly to tool_execution_node.
+        # This block is a secondary guard for any residual state where tool_call
+        # reaches decision_logic without the short-circuit firing.
         if (
             tool_call
             and not state.tool_executed
@@ -414,18 +514,21 @@ class SAMAgentOrchestrator:
                 except Exception:
                     pass
                 # Synthesize tool_call metadata and route to execute_tool
+                _forced_tc = {
+                    "name": "web_search",
+                    "arguments": {"query": forced_query},
+                }
                 return {
                     "command": "execute_tool",
+                    "tool_call": _forced_tc,
+                    "final_output": None,  # Clear any contaminated final_output
                     "model_response": ModelResponse(
                         status=state.model_response.status,
-                        output=state.model_response.output or "",
+                        output="",  # Clear raw tool text from output
                         error_type=state.model_response.error_type,
                         metadata={
                             **(state.model_response.metadata or {}),
-                            "tool_call": {
-                                "name": "web_search",
-                                "arguments": {"query": forced_query},
-                            },
+                            "tool_call": _forced_tc,
                             "forced_tool_call": True,
                         },
                     ),
@@ -605,6 +708,51 @@ class SAMAgentOrchestrator:
             # Tracing failure is non-fatal
             pass
 
+        # ── Tool call detection (short-circuit routing) ───────────────────────
+        # Step 1: check if Ollama backend already parsed a [TOOL_CALL] or loose
+        #         pattern (stored in metadata by OllamaModelBackend.generate()).
+        tool_call = (
+            model_response.metadata.get("tool_call")
+            if model_response.metadata
+            else None
+        )
+
+        # Step 2: if not detected by backend, try orchestrator-level parser on
+        #         the raw output text (catches formats the backend may miss).
+        if not tool_call and model_response.status == "success" and model_response.output:
+            tool_call = self._try_parse_tool_call(model_response.output)
+            if tool_call:
+                # Scrub raw tool syntax from output so it never reaches result_handling
+                model_response = ModelResponse(
+                    status=model_response.status,
+                    output="",
+                    error_type=model_response.error_type,
+                    metadata={**(model_response.metadata or {}), "tool_call": tool_call},
+                )
+
+        # Step 3: if tool_call found and tool not yet run this turn → short-circuit
+        if tool_call and not state.tool_executed:
+            try:
+                self.tracer.record_event(
+                    name="tool_call_detected",
+                    metadata={
+                        "tool_name": tool_call.get("name"),
+                        "source": "model_output",
+                        "tool_call_count": state.tool_call_count,
+                    },
+                    trace_metadata=trace_metadata,
+                )
+            except Exception:
+                pass
+            # Return command="execute_tool" so _route_from_model_call routes
+            # directly to tool_execution_node, bypassing result_handling_node.
+            return {
+                "tool_call": tool_call,
+                "command": "execute_tool",
+                "model_response": model_response,
+                "model_metadata": model_response.metadata,
+            }
+
         return {
             "model_response": model_response,
             "model_metadata": model_response.metadata,
@@ -782,8 +930,9 @@ class SAMAgentOrchestrator:
         """
         trace_metadata = self._create_trace_metadata(state)
 
-        # Extract tool call from model response metadata
-        tool_call = (
+        # Extract tool call: prefer state.tool_call (set by _model_call_node_impl),
+        # fall back to model_response.metadata for the legacy decision_logic path.
+        tool_call = state.tool_call or (
             state.model_response.metadata.get("tool_call")
             if state.model_response and state.model_response.metadata
             else None
@@ -800,6 +949,8 @@ class SAMAgentOrchestrator:
             except Exception:
                 pass
             return {
+                "tool_call": None,
+                "command": None,
                 "tool_executed": True,
                 "tool_call_count": state.tool_call_count + 1,
                 "model_response": None,  # Clear so decision routes to call_model
@@ -822,6 +973,8 @@ class SAMAgentOrchestrator:
                 pass
             # Skip tool, continue flow without tool context
             return {
+                "tool_call": None,
+                "command": None,
                 "tool_executed": True,
                 "tool_call_count": state.tool_call_count + 1,
                 "tool_result": {"error": str(gv)},
@@ -899,6 +1052,10 @@ class SAMAgentOrchestrator:
             "tool_call_count": state.tool_call_count + 1,
             "tool_result": tool_result_dict,
             "tool_context": tool_context,
+            # Clear pending tool_call so it isn't re-executed on the next pass
+            "tool_call": None,
+            # Reset command so second _route_from_model_call doesn't short-circuit again
+            "command": None,
             # Clear model_response so decision_logic routes back to call_model
             "model_response": None,
             # Clear final_output so result_handling_node sets it fresh

@@ -78,8 +78,9 @@ class AgentState:
     # - Tool node NEVER sets command (decision_logic_node retains authority)
     tool_executed: bool = False                      # Has a tool been executed this turn?
     tool_call_count: int = 0                         # Number of tool calls made (guardrail: max 1)
+    tool_call: Optional[Dict[str, Any]] = None       # Pending tool call (set by model_call_node, cleared by tool_execution_node)
     tool_result: Optional[Dict[str, Any]] = None     # Raw result from tool execution
-    tool_context: Optional[str] = None              # Formatted tool results for model context
+    tool_context: Optional[str] = None               # Formatted tool results for model context
 
     def __post_init__(self):
         """Validate state schema."""
