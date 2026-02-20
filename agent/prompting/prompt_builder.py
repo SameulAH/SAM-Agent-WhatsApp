@@ -23,9 +23,11 @@ Invariants:
 from typing import Optional
 
 # ── Budget Constants ──────────────────────────────────────────────────────────
-_MAX_MEMORY_CHARS: int = 2048    # ≈512 tokens: cap on memory context
-_MAX_TOOL_CHARS: int = 2048      # ≈512 tokens: cap on tool results
-_MAX_TOTAL_INJECT_CHARS: int = 1500  # Hard cap on combined injected context
+# Phase 8: tightened from 2048/2048/1500 → 500/800/800.
+# Large injected context was the #2 latency contributor after the 120s timeout.
+_MAX_MEMORY_CHARS: int = 500     # ~125 tokens: cap on memory context
+_MAX_TOOL_CHARS: int = 800       # ~200 tokens: cap on tool results
+_MAX_TOTAL_INJECT_CHARS: int = 800  # Hard cap on combined injected context
 
 # ── Behavioral Contract ───────────────────────────────────────────────────────
 # This is the authoritative system prompt used across all model backends.

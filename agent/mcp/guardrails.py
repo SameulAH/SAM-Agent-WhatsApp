@@ -43,9 +43,11 @@ class MCPGuardrails:
     """
 
     MAX_TOOL_CALLS_PER_TURN: int = 1
-    MAX_RESULTS: int = 5
-    MAX_SNIPPET_LEN: int = 300
-    MAX_TOTAL_CHARS: int = 1500
+    # Phase 4: reduced from 5 → 3 results, 300 → 200 snippet, 1500 → 800 total.
+    # Smaller payload = faster second model pass.
+    MAX_RESULTS: int = 3
+    MAX_SNIPPET_LEN: int = 200
+    MAX_TOTAL_CHARS: int = 800
     MCP_TIMEOUT_S: float = 15.0   # mcp.exa.ai live-crawl can take 8-12 s
 
     @classmethod
@@ -114,13 +116,13 @@ class MCPGuardrails:
         return sanitized
 
     @classmethod
-    def format_tool_context(cls, results: list, max_chars: int = 2048) -> str:
+    def format_tool_context(cls, results: list, max_chars: int = 800) -> str:
         """
         Format sanitized results as injection-safe context string.
 
         Args:
             results: Sanitized BrowserBaseResult list.
-            max_chars: Max character budget for context injection (≈512 tokens).
+            max_chars: Max character budget for context injection (Phase 4: 800).
 
         Returns:
             Formatted context string, truncated if needed.

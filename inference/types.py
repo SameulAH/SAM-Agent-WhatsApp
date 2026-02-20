@@ -10,7 +10,8 @@ class ModelRequest:
     prompt: str
     context: Optional[str] = None
     constraints: Optional[Dict[str, Any]] = None
-    timeout_s: Optional[int] = 30
+    # Phase 3: hard cap at 15s (was 30). Prevents hidden 60-120s hangs.
+    timeout_s: Optional[int] = 15
     trace_id: Optional[str] = None
 
 

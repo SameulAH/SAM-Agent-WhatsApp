@@ -14,12 +14,15 @@ Phase MCP: Added tool_execution_node and execute_tool routing.
 - Max 1 tool call per turn enforced via guardrails
 """
 
+import logging
 from typing import Any, Dict, Optional
 from datetime import datetime
 from uuid import uuid4
 import json
 import re
 import time
+
+logger = logging.getLogger(__name__)
 
 from langgraph.graph import StateGraph
 
@@ -51,9 +54,12 @@ class SAMAgentOrchestrator:
     MAX_OUTPUT_SENTENCES: int = 5        # Soft ceiling (applied before char limit)
 
     # ── Freshness keywords that trigger forced web_search ────────────────────
+    # Phase 5: only keep keywords that are truly time-sensitive.
+    # Removed: "now", "currently", "update", "updates", "live" — too broad,
+    # fired on conversational queries and caused an extra ~20s tool round-trip.
     _FRESHNESS_KEYWORDS: frozenset = frozenset({
-        "today", "latest", "current", "recent", "breaking", "news",
-        "right now", "currently", "now", "live", "update", "updates",
+        "today", "latest", "recent", "breaking", "news",
+        "right now", "this week", "this month", "current events",
     })
 
     def __init__(
@@ -224,7 +230,24 @@ class SAMAgentOrchestrator:
         try:
             # Execute node
             result = node_fn(state)
-            duration_ms = (time.time() - start_time) * 1000
+            duration_s = time.time() - start_time
+            duration_ms = duration_s * 1000
+
+            # ── Phase 1: mandatory latency log ────────────────────────────
+            logger.info(f"[LATENCY] {node_name} took {duration_s:.3f}s")
+
+            # Emit node_latency tracer event (non-blocking)
+            try:
+                self.tracer.record_event(
+                    name="node_latency",
+                    metadata={
+                        "node_name": node_name,
+                        "duration_ms": duration_ms,
+                    },
+                    trace_metadata=trace_metadata,
+                )
+            except Exception:
+                pass
 
             # Node exit span
             try:
@@ -240,7 +263,11 @@ class SAMAgentOrchestrator:
             return result
         except Exception as e:
             # Exception handling (node failure)
-            duration_ms = (time.time() - start_time) * 1000
+            duration_s = time.time() - start_time
+            duration_ms = duration_s * 1000
+
+            # ── Phase 1: mandatory latency log (failure path) ─────────────
+            logger.info(f"[LATENCY] {node_name} FAILED after {duration_s:.3f}s ({type(e).__name__})")
 
             # Record failure span
             try:
@@ -610,6 +637,8 @@ class SAMAgentOrchestrator:
 
         if state.long_term_memory_read_result:
             facts = state.long_term_memory_read_result.get("facts", [])
+            # Phase 8: cap at 3 facts — large memory injection slows model pass
+            facts = facts[:3]
             if facts:
                 lines = [
                     f"- {f.get('content', f) if isinstance(f.get('content'), str) else str(f.get('content', ''))}"
@@ -667,11 +696,13 @@ class SAMAgentOrchestrator:
                 pass
 
         # ── Build ModelRequest (context already embedded in prompt) ───────────
+        # Phase 3: 15s hard cap — eliminates the hidden 120s default that caused
+        # 20-68s traces.  The error_router_node surfaces a friendly timeout message.
         request = ModelRequest(
             task="respond",
             prompt=prompt,
             context=None,   # tool_context is now embedded in prompt via build_prompt
-            timeout_s=120,
+            timeout_s=15,
             trace_id=state.trace_id,
         )
 
