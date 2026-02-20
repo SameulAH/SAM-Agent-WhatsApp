@@ -52,7 +52,8 @@ RUN if [ "$INSTALL_COQUI" = "true" ]; then \
     fi
 
 # Install gTTS for text-to-speech voice replies
-RUN pip install --no-cache-dir gtts
+# Re-pin click>=8.2.1 after gtts installs an older version
+RUN pip install --no-cache-dir gtts "click>=8.2.1"
 
 # ============================================================================
 # Stage 2: Base Runtime (CPU)
