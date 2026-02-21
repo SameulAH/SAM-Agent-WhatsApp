@@ -103,7 +103,7 @@ class SAMAgentOrchestrator:
         graph.add_node("task_preprocessing_node", self._task_preprocessing_node)
         graph.add_node("memory_read_node", self._memory_read_node_wrapper)  # Phase 2
         graph.add_node("model_call_node", self._model_call_node)
-        graph.add_node("result_handling_node", self._result_handling_node)
+        # result_handling_node removed (single-model-pass: model → format directly)
         graph.add_node("memory_write_node", self._memory_write_node_wrapper)  # Phase 2
         graph.add_node("long_term_memory_read_node", self._long_term_memory_read_node_wrapper)  # Phase 3.2
         graph.add_node("long_term_memory_write_node", self._long_term_memory_write_node_wrapper)  # Phase 3.2
@@ -138,19 +138,17 @@ class SAMAgentOrchestrator:
         graph.add_edge("memory_read_node", "decision_logic_node")
         graph.add_edge("long_term_memory_read_node", "decision_logic_node")  # Phase 3.2
         graph.add_edge("tool_execution_node", "decision_logic_node")  # Phase MCP
-        
-        # model_call_node branches on success / tool-detected / failure
+
+        # Single-model-pass: model_call_node exits directly to format (no tool loop-back)
+        # Failures are handled by error_router_node via format_response_node
         graph.add_conditional_edges(
             "model_call_node",
             self._route_from_model_call,
             {
-                "success": "result_handling_node",
-                "execute_tool": "tool_execution_node",  # Short-circuit: bypass result_handling
+                "success": "format_response_node",
                 "failure": "error_router_node",
             }
         )
-
-        graph.add_edge("result_handling_node", "decision_logic_node")
         graph.add_edge("memory_write_node", "decision_logic_node")
         graph.add_edge("long_term_memory_write_node", "decision_logic_node")  # Phase 3.2
         
@@ -184,15 +182,10 @@ class SAMAgentOrchestrator:
     def _route_from_model_call(self, state: AgentState) -> str:
         """Route based on model response status.
 
-        Three routes:
-          • "execute_tool" — tool_call detected by _model_call_node_impl → skip
-                             result_handling_node, go directly to tool_execution_node
-          • "success"      — clean text response → result_handling_node
-          • "failure"      — error response → error_router_node
+        Single-model-pass architecture: model never loops back to tools.
+          • "success" → format_response_node
+          • "failure" → error_router_node
         """
-        # Short-circuit: tool_call detected, bypass result_handling entirely
-        if state.command == "execute_tool":
-            return "execute_tool"
         if state.model_response and state.model_response.status == "success":
             return "success"
         return "failure"
@@ -430,23 +423,27 @@ class SAMAgentOrchestrator:
         Make control flow decisions.
         
         Responsibility: Emit next command based on state
-        
-        Command sequence (with optional memory and tool execution):
+
+        Single-model-pass architecture:
+        - Tool routing is decided BEFORE the model is called (Phase 2b below)
+        - model_call_node NEVER routes back to tools; it exits directly to format
+        - decision_logic_node is the SOLE authority for execute_tool routing
+
+        Command sequence:
         1. After state_init: preprocess
-        2. After preprocessing: STM read (if authorized) → LTM read → call_model
-        3. After memory_read / ltm_read: call_model
-        4. After model_call:
-           a. If model emitted tool_call AND tool not yet executed → execute_tool
-           b. If freshness keywords in query AND no tool_call AND not yet executed → forced execute_tool
-           c. Else: memory_write → long_term_memory_write → format
-        5. After tool_execution: call_model (model_response cleared by tool node)
-        6. After memory_write: long_term_memory_write → format
-        
+        2. After preprocessing:
+           a. STM read (if authorized) → LTM read → tool check → call_model
+           b. If freshness keyword (and no tool run yet) → execute_tool
+        3. After tool_execution: call_model (tool_executed=True, model_response=None)
+        4. After model_call: memory_write → long_term_memory_write → format
+           (model_call_node now routes directly to format_response_node; this
+            branch is only reached via the memory cycle path below)
+
         Rules:
         - Must NOT execute tasks
         - Must NOT call model
         - Must NOT mutate state directly (only set command + forced_tool metadata)
-        - Tool call authority: tool_call_count < 1 (guardrail: max 1 per turn)
+        - Tool call authority: tool_call_count < MAX_TOOL_CALLS_PER_TURN (max 1)
         
         Note: Tracing NOT wrapped here (decision logic is not observed externally).
         """
@@ -470,98 +467,51 @@ class SAMAgentOrchestrator:
                 and state.long_term_memory_status == "available"
             ):
                 return {"command": "long_term_memory_read"}
+
+            # ── Phase 2b: Pre-model tool routing ─────────────────────────────
+            # This is the ONLY place execute_tool is emitted.  Check freshness
+            # keywords in the user query before the first model call.
+            if state.tool_call_count < MCPGuardrails.MAX_TOOL_CALLS_PER_TURN:
+                query_lower = (state.preprocessing_result or state.raw_input or "").lower()
+                has_freshness = any(kw in query_lower for kw in self._FRESHNESS_KEYWORDS)
+
+                if has_freshness:
+                    forced_query = state.preprocessing_result or state.raw_input
+                    try:
+                        self.tracer.record_event(
+                            name="tool_intent_detected",
+                            metadata={
+                                "query_preview": query_lower[:80],
+                                "trigger": "freshness_keyword_pre_model",
+                            },
+                            trace_metadata=trace_metadata,
+                        )
+                        self.tracer.record_event(
+                            name="forced_tool_call",
+                            metadata={
+                                "tool_name": "web_search",
+                                "reason": "freshness_keyword_no_tool_call",
+                            },
+                            trace_metadata=trace_metadata,
+                        )
+                    except Exception:
+                        pass
+                    _forced_tc = {
+                        "name": "web_search",
+                        "arguments": {"query": forced_query},
+                    }
+                    return {
+                        "command": "execute_tool",
+                        "tool_call": _forced_tc,
+                    }
+
             return {"command": "call_model"}
 
-        # ── Phase 3: After model call ────────────────────────────────────────
-        # Check if model requested a tool call
-        tool_call = (
-            state.model_response.metadata.get("tool_call")
-            if state.model_response.metadata
-            else None
-        )
+        # ── Phase 3: After model call — memory/format routing ────────────────
+        # model_call_node now exits directly to format_response_node via a hard
+        # graph edge, so this branch is only reached when the memory-write cycle
+        # loops back here (memory_write_node → decision_logic_node).
 
-        # Phase MCP: Safety-net routing for tool execution.
-        # Primary path: _model_call_node_impl sets command="execute_tool" and
-        # _route_from_model_call short-circuits directly to tool_execution_node.
-        # This block is a secondary guard for any residual state where tool_call
-        # reaches decision_logic without the short-circuit firing.
-        if (
-            tool_call
-            and not state.tool_executed
-            and state.tool_call_count < MCPGuardrails.MAX_TOOL_CALLS_PER_TURN
-        ):
-            # Emit trace event for tool_call_detected
-            try:
-                self.tracer.record_event(
-                    name="tool_call_detected",
-                    metadata={
-                        "tool_name": tool_call.get("name"),
-                        "tool_call_count": state.tool_call_count,
-                        "forced": False,
-                    },
-                    trace_metadata=trace_metadata,
-                )
-            except Exception:
-                pass
-            return {"command": "execute_tool"}
-
-        # ── Phase 3b: Freshness keyword guardrail ────────────────────────────
-        # If the user query contained freshness keywords AND the model did NOT
-        # emit a tool_call, force a web_search by synthesizing the tool_call
-        # and routing to execute_tool.  Prevents model hesitation on time-
-        # sensitive queries.
-        if (
-            not tool_call
-            and not state.tool_executed
-            and state.tool_call_count < MCPGuardrails.MAX_TOOL_CALLS_PER_TURN
-        ):
-            query_lower = (state.preprocessing_result or state.raw_input or "").lower()
-            # Check word-boundary matching for multi-word phrases too
-            has_freshness = any(kw in query_lower for kw in self._FRESHNESS_KEYWORDS)
-
-            if has_freshness:
-                forced_query = state.preprocessing_result or state.raw_input
-                try:
-                    self.tracer.record_event(
-                        name="tool_intent_detected",
-                        metadata={
-                            "query_preview": query_lower[:80],
-                            "trigger": "freshness_keyword_guardrail",
-                        },
-                        trace_metadata=trace_metadata,
-                    )
-                    self.tracer.record_event(
-                        name="forced_tool_call",
-                        metadata={
-                            "tool_name": "web_search",
-                            "reason": "freshness_keyword_no_tool_call",
-                        },
-                        trace_metadata=trace_metadata,
-                    )
-                except Exception:
-                    pass
-                # Synthesize tool_call metadata and route to execute_tool
-                _forced_tc = {
-                    "name": "web_search",
-                    "arguments": {"query": forced_query},
-                }
-                return {
-                    "command": "execute_tool",
-                    "tool_call": _forced_tc,
-                    "final_output": None,  # Clear any contaminated final_output
-                    "model_response": ModelResponse(
-                        status=state.model_response.status,
-                        output="",  # Clear raw tool text from output
-                        error_type=state.model_response.error_type,
-                        metadata={
-                            **(state.model_response.metadata or {}),
-                            "tool_call": _forced_tc,
-                            "forced_tool_call": True,
-                        },
-                    ),
-                }
-
-        # ── Phase 4: Post-tool or no-tool memory/format routing ──────────────
         # Case 1: Memory write authorized but not yet executed
         if state.memory_write_authorized and state.memory_write_status is None:
             return {"command": "memory_write"}
@@ -574,7 +524,6 @@ class SAMAgentOrchestrator:
             }
 
         # Case 3: STM write done — now check long-term memory write
-        # Write to Qdrant if not yet attempted this turn
         if state.long_term_memory_write_status is None:
             return {"command": "long_term_memory_write"}
 
@@ -696,13 +645,13 @@ class SAMAgentOrchestrator:
                 pass
 
         # ── Build ModelRequest (context already embedded in prompt) ───────────
-        # Phase 3: 15s hard cap — eliminates the hidden 120s default that caused
-        # 20-68s traces.  The error_router_node surfaces a friendly timeout message.
+        # Phase 3: 45s cap — tool context adds tokens so model needs more headroom.
+        # Simple queries still return in <5s; freshness queries with context ~10-25s.
         request = ModelRequest(
             task="respond",
             prompt=prompt,
             context=None,   # tool_context is now embedded in prompt via build_prompt
-            timeout_s=15,
+            timeout_s=45,
             trace_id=state.trace_id,
         )
 
@@ -739,50 +688,9 @@ class SAMAgentOrchestrator:
             # Tracing failure is non-fatal
             pass
 
-        # ── Tool call detection (short-circuit routing) ───────────────────────
-        # Step 1: check if Ollama backend already parsed a [TOOL_CALL] or loose
-        #         pattern (stored in metadata by OllamaModelBackend.generate()).
-        tool_call = (
-            model_response.metadata.get("tool_call")
-            if model_response.metadata
-            else None
-        )
-
-        # Step 2: if not detected by backend, try orchestrator-level parser on
-        #         the raw output text (catches formats the backend may miss).
-        if not tool_call and model_response.status == "success" and model_response.output:
-            tool_call = self._try_parse_tool_call(model_response.output)
-            if tool_call:
-                # Scrub raw tool syntax from output so it never reaches result_handling
-                model_response = ModelResponse(
-                    status=model_response.status,
-                    output="",
-                    error_type=model_response.error_type,
-                    metadata={**(model_response.metadata or {}), "tool_call": tool_call},
-                )
-
-        # Step 3: if tool_call found and tool not yet run this turn → short-circuit
-        if tool_call and not state.tool_executed:
-            try:
-                self.tracer.record_event(
-                    name="tool_call_detected",
-                    metadata={
-                        "tool_name": tool_call.get("name"),
-                        "source": "model_output",
-                        "tool_call_count": state.tool_call_count,
-                    },
-                    trace_metadata=trace_metadata,
-                )
-            except Exception:
-                pass
-            # Return command="execute_tool" so _route_from_model_call routes
-            # directly to tool_execution_node, bypassing result_handling_node.
-            return {
-                "tool_call": tool_call,
-                "command": "execute_tool",
-                "model_response": model_response,
-                "model_metadata": model_response.metadata,
-            }
+        # ── Tool call detection removed (single-model-pass architecture) ──────
+        # model_call_node no longer detects or routes to tools.
+        # decision_logic_node handles all tool routing BEFORE the model call.
 
         return {
             "model_response": model_response,
@@ -895,16 +803,58 @@ class SAMAgentOrchestrator:
 
     def _format_response_node_impl(self, state: AgentState) -> Dict[str, Any]:
         """Format response node implementation (unwrapped)."""
-        response = {
-            "conversation_id": state.conversation_id,
-            "trace_id": state.trace_id,
-            "status": "success" if state.error_type is None else "error",
-            "output": state.final_output,
-            "error_type": state.error_type,
-            "metadata": state.model_metadata or {},
-        }
+        # ── Derive final_output from model_response if not already set ────────
+        # model_call_node now routes directly here; final_output is not set by
+        # a result_handling_node anymore, so we resolve it here.
+        final_output = state.final_output
+        if final_output is None and state.model_response:
+            if state.model_response.status == "success" and state.model_response.output:
+                final_output = state.model_response.output
 
-        return response
+        # Safety fallback: model emitted a tool call again (output stripped to "") but
+        # we already have tool_context — synthesize a minimal answer from context.
+        if not final_output and state.tool_context:
+            import re as _re_fb
+            # Extract first substantive sentence from tool_context
+            sentences = _re_fb.split(r"(?<=[.!?])\s+", state.tool_context.strip())
+            snippet = " ".join(sentences[:2]).strip()[:300]
+            if snippet:
+                final_output = f"Based on recent search results: {snippet}"
+
+        # ── Output conciseness enforcement (migrated from result_handling_node) ─
+        if final_output:
+            original_len = len(final_output)
+            truncated = False
+
+            import re as _re
+            sentences = _re.split(r"(?<=[.!?])\s+", final_output.strip())
+            if len(sentences) > self.MAX_OUTPUT_SENTENCES:
+                final_output = " ".join(sentences[: self.MAX_OUTPUT_SENTENCES]).strip()
+                truncated = True
+
+            if len(final_output) > self.MAX_OUTPUT_CHARS:
+                final_output = final_output[: self.MAX_OUTPUT_CHARS] + "..."
+                truncated = True
+
+            if truncated:
+                trace_metadata = self._create_trace_metadata(state)
+                try:
+                    self.tracer.record_event(
+                        name="response_truncated",
+                        metadata={
+                            "original_length": original_len,
+                            "final_length": len(final_output),
+                            "max_chars": self.MAX_OUTPUT_CHARS,
+                        },
+                        trace_metadata=trace_metadata,
+                    )
+                except Exception:
+                    pass
+
+        # Write final_output into state so invoke() can read it via result.get("final_output")
+        return {
+            "final_output": final_output,
+        }
 
     # ─────────────────────────────────────────────────────
     # TOOL EXECUTION NODE (Phase MCP)
