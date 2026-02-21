@@ -62,6 +62,21 @@ class SAMAgentOrchestrator:
         "right now", "this week", "this month", "current events",
     })
 
+    # ── Reference patterns that signal conversational back-references ─────────
+    # When detected, STM + LTM context is retrieved before the model call so
+    # the agent can ground its response in prior conversation history.
+    _REFERENCE_PATTERNS: frozenset = frozenset({
+        "that", "it", "this", "one day", "as we discussed",
+        "like before", "earlier", "previously", "we talked",
+        "you said", "remember", "last time", "you mentioned",
+        "what i said", "what you said", "as i said", "as you said",
+    })
+
+    @classmethod
+    def _requires_memory_retrieval(cls, text: str) -> bool:
+        """Return True if text contains a conversational back-reference signal."""
+        return any(pat in text for pat in cls._REFERENCE_PATTERNS)
+
     def __init__(
         self,
         model_backend: Optional[ModelBackend] = None,
@@ -458,9 +473,33 @@ class SAMAgentOrchestrator:
             # Post-tool re-call: skip memory reads (already done in turn 1)
             if state.tool_executed:
                 return {"command": "call_model"}
-            # STM read if authorized and not yet executed
-            if state.memory_read_authorized and state.memory_read_result is None:
-                return {"command": "memory_read"}
+
+            # ── Reference-signal-gated STM read ──────────────────────────────
+            # Detect conversational back-references BEFORE tool routing so the
+            # model is grounded in prior context when it generates the answer.
+            # Triggered once per turn: guarded by memory_read_authorized flag.
+            user_text_mem = (state.preprocessing_result or state.raw_input or "").lower()
+            if (
+                not state.memory_read_authorized
+                and state.memory_read_result is None
+                and self._requires_memory_retrieval(user_text_mem)
+            ):
+                try:
+                    self.tracer.record_event(
+                        name="memory_retrieval_triggered",
+                        metadata={
+                            "trigger": "reference_signal",
+                            "query_preview": user_text_mem[:80],
+                        },
+                        trace_metadata=trace_metadata,
+                    )
+                except Exception:
+                    pass
+                return {
+                    "command": "memory_read",
+                    "memory_read_authorized": True,
+                }
+
             # LTM read: attempt once per turn if not yet done and store is available
             if (
                 state.long_term_memory_read_result is None
@@ -598,12 +637,22 @@ class SAMAgentOrchestrator:
                     memory_context_parts.append("Remembered facts:\n" + "\n".join(lines))
 
         if state.memory_read_result:
-            ctx = (
+            # Build a human-readable prior-turn summary from STM data
+            stm_parts = []
+            prior_input = state.memory_read_result.get("raw_input")
+            prior_output = (
                 state.memory_read_result.get("final_output")
                 or state.memory_read_result.get("conversation_context")
             )
-            if ctx:
-                memory_context_parts.append(f"Recent context:\n{ctx}")
+            if prior_input:
+                stm_parts.append(f"User previously said: {prior_input}")
+            if prior_output:
+                stm_parts.append(f"You previously answered: {prior_output}")
+            if stm_parts:
+                memory_context_parts.append("Prior conversation:\n" + "\n".join(stm_parts))
+            elif prior_output:
+                # fallback: plain context string
+                memory_context_parts.append(f"Prior conversation:\n{prior_output}")
 
         if memory_context_parts:
             memory_context = "\n\n".join(memory_context_parts)

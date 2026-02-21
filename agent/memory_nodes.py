@@ -161,7 +161,8 @@ class MemoryNodeManager:
             conversation_id=state.conversation_id,
             key="conversation_context",  # Default key
             data={
-                "final_output": state.final_output,
+                "raw_input": state.raw_input,               # What the user said
+                "final_output": state.final_output,         # What SAM answered
                 "interaction_timestamp": state.created_at,
             },
             authorized=True,
