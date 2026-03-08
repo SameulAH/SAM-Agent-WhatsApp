@@ -11,6 +11,7 @@ Run: uvicorn main:app --reload --host 0.0.0.0 --port 8000
 """
 
 import logging
+import os
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
@@ -22,10 +23,19 @@ from webhook.telegram_voice import voice_router
 from config import Config
 
 # Setup logging
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-)
+_log_level = getattr(logging, os.getenv("LOG_LEVEL", "INFO").upper(), logging.INFO)
+_log_fmt = logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+
+logging.basicConfig(level=_log_level, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+
+# Explicitly pin a StreamHandler on the 'agent' namespace so [LATENCY] logs
+# survive Uvicorn's logging reconfiguration (which clears root handlers).
+_agent_stream_handler = logging.StreamHandler()
+_agent_stream_handler.setFormatter(_log_fmt)
+_agent_logger = logging.getLogger("agent")
+_agent_logger.setLevel(_log_level)
+if not _agent_logger.handlers:
+    _agent_logger.addHandler(_agent_stream_handler)
 logger = logging.getLogger(__name__)
 
 

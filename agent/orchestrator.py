@@ -13,6 +13,9 @@ from agent.langgraph_orchestrator import SAMAgentOrchestrator
 from inference import ModelBackend, StubModelBackend
 from inference.ollama import OllamaModelBackend
 from config import Config
+import logging
+
+logger = logging.getLogger(__name__)
 
 
 def _default_model_backend() -> ModelBackend:
@@ -23,6 +26,40 @@ def _default_model_backend() -> ModelBackend:
             base_url=Config.OLLAMA_BASE_URL,
         )
     return StubModelBackend()
+
+
+def _default_stm_store():
+    """
+    Return a SQLiteShortTermMemoryStore backed by the configured DB path.
+    Falls back to StubMemoryController gracefully if SQLite fails.
+    """
+    try:
+        from agent.memory.sqlite import SQLiteShortTermMemoryStore
+        db_path = Config.SQLITE_DB_PATH
+        store = SQLiteShortTermMemoryStore(db_path=db_path)
+        logger.info(f"STM: SQLiteShortTermMemoryStore initialised at {db_path}")
+        return store
+    except Exception as e:
+        from agent.memory.stub import StubMemoryController
+        logger.warning(f"STM: falling back to StubMemoryController ({e})")
+        return StubMemoryController()
+
+
+def _default_ltm_store():
+    """
+    Return a QdrantLongTermMemoryStore when LTM_BACKEND=qdrant (the default),
+    otherwise a StubLongTermMemoryStore.
+
+    Delegates to InfraConfig so all env-var reading is in one place.
+    Falls back to the stub gracefully if qdrant-client is not installed or
+    Qdrant is unreachable at startup.
+    """
+    try:
+        from infra.config import InfraConfig
+        return InfraConfig.from_env().create_ltm_backend()
+    except Exception:
+        from agent.memory.long_term_stub import StubLongTermMemoryStore
+        return StubLongTermMemoryStore()
 
 
 class SAMOrchestrator:
@@ -40,7 +77,9 @@ class SAMOrchestrator:
             model_backend: ModelBackend instance (uses configured backend by default)
         """
         self.langgraph_orchestrator = SAMAgentOrchestrator(
-            model_backend=model_backend or _default_model_backend()
+            model_backend=model_backend or _default_model_backend(),
+            memory_controller=_default_stm_store(),
+            long_term_memory_store=_default_ltm_store(),
         )
     
     async def invoke(self, raw_input: str, conversation_id: Optional[str] = None, trace_id: Optional[str] = None) -> Dict[str, Any]:

@@ -48,10 +48,12 @@ voice_router = APIRouter(prefix="/webhook", tags=["voice"])
 
 def clean_agent_response(text: str) -> str:
     """
-    Strip chain-of-thought / reasoning from the agent's raw output.
+    Strip chain-of-thought / reasoning / leaked tool syntax from agent output.
 
     The phi model sometimes wraps reasoning in <think>...</think> tags,
     or emits "Let me think..." preambles before the actual answer.
+    phi3:mini may also leak [Web_Search]{...} markers or fabricated
+    "Tool Results:" blocks into the visible output when tool call detection fails.
     We keep only the final answer portion.
     """
     import re
@@ -66,16 +68,33 @@ def clean_agent_response(text: str) -> str:
     text = re.sub(r'<\|im_start\|>\w*\n?', '', text)
     text = re.sub(r'<\|im_end\|>', '', text)
 
-    # 3. If "Answer:" or "Response:" header exists, keep only what follows
+    # 3. Strip leaked [TOOL_CALL] / [Web_Search] markers and everything after them
+    #    (safety net: the parser should have caught these, but defensively clean output)
+    m = re.search(r'\[(TOOL_CALL|Web_Search|web_search)\]', text, re.IGNORECASE)
+    if m:
+        text = text[: m.start()].strip()
+
+    # 4. Strip fabricated "Tool Results:" sections and everything after them
+    m = re.search(r'\bTool Results?:', text, re.IGNORECASE)
+    if m:
+        text = text[: m.start()].strip()
+
+    # 5. Strip "Web search tool called..." preamble lines that phi3 sometimes emits
+    text = re.sub(
+        r'^Web search tool called[^\n]*\n?',
+        '', text, flags=re.IGNORECASE | re.MULTILINE,
+    )
+
+    # 6. If "Answer:" or "Response:" header exists, keep only what follows
     for marker in (r'Answer:', r'Response:', r'Final answer:', r'My answer:'):
         match = re.search(marker, text, re.IGNORECASE)
         if match:
             text = text[match.end():]
             break
 
-    # 4. Strip leading filler phrases
+    # 7. Strip leading filler phrases
     filler_patterns = [
-        r'^(Sure[,!.]?\s*)', r'^(Of course[,!.]?\s*)', r'^(Certainly[,!.]?\s*)',
+        r'^(Sure[,!.\?]?\s*)', r'^(Of course[,!.\?]?\s*)', r'^(Certainly[,!.\?]?\s*)',
         r'^(Let me (think|explain|help)[^.]*\.\s*)', r'^(Here\'s my (answer|response)[^:]*:\s*)',
         r'^(I\'d be (happy|glad) to[^.]*\.\s*)',
     ]

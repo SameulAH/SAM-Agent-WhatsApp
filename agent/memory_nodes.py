@@ -156,13 +156,21 @@ class MemoryNodeManager:
                 "memory_available": state.memory_available,
             }
 
+        # Derive final_output: state.final_output is set by format_response_node which
+        # runs AFTER memory_write in the new graph flow. Fall back to model_response.output
+        # so we always store a non-null answer.
+        final_out = state.final_output
+        if final_out is None and state.model_response:
+            if state.model_response.status == "success" and state.model_response.output:
+                final_out = state.model_response.output
+
         # Build request (store derived facts only)
         request = MemoryWriteRequest(
             conversation_id=state.conversation_id,
             key="conversation_context",  # Default key
             data={
                 "raw_input": state.raw_input,               # What the user said
-                "final_output": state.final_output,         # What SAM answered
+                "final_output": final_out,                  # What SAM answered
                 "interaction_timestamp": state.created_at,
             },
             authorized=True,

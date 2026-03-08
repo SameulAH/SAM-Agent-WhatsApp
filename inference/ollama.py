@@ -12,20 +12,26 @@ from .types import ModelRequest, ModelResponse
 from agent.prompting.prompt_builder import SYSTEM_PROMPT as _SYSTEM_PROMPT  # noqa: E402
 
 # Regex to locate the [TOOL_CALL] marker (case-insensitive for robustness)
-_TOOL_CALL_MARKER_RE = re.compile(r"\[TOOL_CALL\]", re.IGNORECASE)
+# Also matches [Web_Search] and [web_search] emitted by phi3:mini and similar models
+_TOOL_CALL_MARKER_RE = re.compile(r"\[TOOL_CALL\]|\[Web_Search\]", re.IGNORECASE)
 # Fallback: pull the query field out of truncated JSON.
 # The closing quote is optional so truncated values like "define got your messa)
 # (missing the closing ") are still captured.
 _QUERY_FALLBACK_RE = re.compile(r'"query"\s*:\s*"([^"]*)"?')
+# Pattern for bare {"query": "..."} that phi3:mini emits after [Web_Search]
+_BARE_QUERY_RE = re.compile(r'\{\s*"query"\s*:\s*"([^"]*)"', re.IGNORECASE)
 
 
 def _extract_tool_call(output: str):
     """
-    Find [TOOL_CALL]{...} in model output using brace-counting.
+    Find [TOOL_CALL]{...} or [Web_Search]{...} in model output using brace-counting.
 
     The old single-regex approach ({.*?}) stops at the FIRST closing brace,
     which is the inner 'arguments' object — producing invalid JSON every time.
     Brace-counting correctly handles nested objects.
+
+    Also handles phi3:mini's [Web_Search]{"query": "..."} shorthand by
+    normalising it into the standard {"name": "web_search", "arguments": {...}}.
 
     Returns:
         (tool_call_dict, cleaned_output) on success
@@ -36,7 +42,10 @@ def _extract_tool_call(output: str):
     if not marker:
         return None, output
 
-    # Always strip [TOOL_CALL] and everything after it from the visible output
+    marker_text = marker.group(0).lower()  # "[tool_call]" or "[web_search]"
+    is_web_search_shorthand = "web_search" in marker_text
+
+    # Always strip [TOOL_CALL]/[Web_Search] and everything after it from the visible output
     clean = output[: marker.start()].strip()
 
     brace_start = output.find("{", marker.end())
@@ -58,10 +67,17 @@ def _extract_tool_call(output: str):
     json_str = output[brace_start:brace_end] if brace_end != -1 else output[brace_start:]
 
     try:
-        return json.loads(json_str), clean
+        parsed = json.loads(json_str)
+        # [Web_Search]{"query": "..."} — bare query dict, normalise it
+        if is_web_search_shorthand or ("query" in parsed and "name" not in parsed):
+            return {
+                "name": "web_search",
+                "arguments": {"query": parsed.get("query", "")},
+            }, clean
+        return parsed, clean
     except json.JSONDecodeError:
         # Truncated / malformed JSON — try to at least salvage the query string
-        q = _QUERY_FALLBACK_RE.search(json_str)
+        q = _QUERY_FALLBACK_RE.search(json_str) or _BARE_QUERY_RE.search(output[marker.end():])
         if q:
             return {
                 "name": "web_search",

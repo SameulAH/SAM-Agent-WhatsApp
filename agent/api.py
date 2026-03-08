@@ -11,6 +11,8 @@ Can be run as a module:
 """
 
 import sys
+import os
+import logging
 import argparse
 from typing import Optional
 
@@ -147,7 +149,7 @@ def create_app():
                 
                 if stm_backend == "sqlite":
                     from agent.memory import SQLiteShortTermMemoryStore
-                    db_path = os.getenv("DATABASE_PATH", "/app/data/memory.db")
+                    db_path = os.getenv("SQLITE_DB_PATH", os.getenv("DATABASE_PATH", "/app/data/memory.db"))
                     memory_controller = SQLiteShortTermMemoryStore(db_path=db_path)
                 else:
                     from agent.memory import StubMemoryController
@@ -360,6 +362,19 @@ def create_app():
 
 def main(host: str = "0.0.0.0", port: int = 8000, reload: bool = False):
     """Run agent API server."""
+    # ── Logging setup (must run before uvicorn reconfigures logging) ──────────
+    _log_level = getattr(logging, os.getenv("LOG_LEVEL", "INFO").upper(), logging.INFO)
+    _log_fmt = logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+    logging.basicConfig(level=_log_level, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+    # Pin a StreamHandler to the 'agent' namespace so [LATENCY]/[DMA] logs
+    # survive Uvicorn's dictConfig overwrite of the root logger.
+    _agent_logger = logging.getLogger("agent")
+    _agent_logger.setLevel(_log_level)
+    if not _agent_logger.handlers:
+        _h = logging.StreamHandler()
+        _h.setFormatter(_log_fmt)
+        _agent_logger.addHandler(_h)
+
     app = create_app()
     
     if app is None:

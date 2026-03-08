@@ -74,7 +74,7 @@ services:
       QDRANT_API_KEY: ${QDRANT_API_KEY:-}
       
       # Database
-      DATABASE_PATH: /app/data/memory.db
+      SQLITE_DB_PATH: /app/data/memory.db
       
       # Observability - LangChain/LangSmith Integration
       LANGCHAIN_TRACING_V2: ${LANGCHAIN_TRACING_V2:-true}
@@ -96,6 +96,12 @@ services:
       BRAVE_CONNECTION_ID: ${BRAVE_CONNECTION_ID:-}
       LINKUP_CONNECTION_ID: ${LINKUP_CONNECTION_ID:-}
       
+      # Tracing backend
+      TRACER_BACKEND: ${TRACER_BACKEND:-noop}
+
+      # Logging
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+
       # Python
       PYTHONUNBUFFERED: "1"
       PYTHONDONTWRITEBYTECODE: "1"

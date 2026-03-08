@@ -67,6 +67,17 @@ class AgentState:
     long_term_memory_read_result: Optional[Dict[str, Any]] = None  # Facts retrieved (if authorized)
     long_term_memory_write_status: Optional[str] = None  # Status of long-term fact write
 
+    # ── Deterministic Memory Intent (Phase DMA) ──────────────────────────────
+    # Set by memory_access_decision_node (rule-based, no LLM).
+    # These two booleans gate the entire memory pipeline:
+    #   requires_memory_write=False AND requires_memory_read=False → direct model path
+    requires_memory_write: bool = False  # Declarative fact detected in input
+    requires_memory_read: bool = False   # Retrieval reference detected in input
+    # Facts produced by fact_extraction_node (Phase DMA)
+    extracted_facts: Optional[List[Any]] = None
+    # Authorization produced by write_authorization_node (Phase DMA)
+    write_authorization_checked: bool = False
+
     # ── Tool Execution (Phase MCP) ────────────────────────────────────────────
     # These fields track tool calls per turn.
     # Invariants:

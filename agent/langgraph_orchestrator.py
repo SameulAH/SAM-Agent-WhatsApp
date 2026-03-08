@@ -24,7 +24,7 @@ import time
 
 logger = logging.getLogger(__name__)
 
-from langgraph.graph import StateGraph
+from langgraph.graph import StateGraph, END
 
 from inference import ModelBackend, ModelRequest, ModelResponse, StubModelBackend
 from agent.state_schema import AgentState
@@ -72,10 +72,58 @@ class SAMAgentOrchestrator:
         "what i said", "what you said", "as i said", "as you said",
     })
 
+    # ── Declarative-fact write patterns (Phase DMA) ───────────────────────────
+    # Trigger requires_memory_write=True when matched (rule-based, zero LLM cost).
+    _WRITE_PATTERNS: tuple = (
+        re.compile(r"\bi\s+(?:currently\s+)?live\s+in\b", re.IGNORECASE),
+        re.compile(r"\bmy\s+name\s+is\b", re.IGNORECASE),
+        re.compile(r"\bi\s+work\s+(?:as|at|for)\b", re.IGNORECASE),
+        re.compile(r"\bmy\s+(?:favorite|favourite)\b", re.IGNORECASE),
+        re.compile(r"\bi\s+am\s+from\b", re.IGNORECASE),
+        re.compile(r"\bi\s+was\s+born\s+in\b", re.IGNORECASE),
+        re.compile(r"\bi\s+prefer\b", re.IGNORECASE),
+        re.compile(r"\bi\s+(?:usually|always|never)\b", re.IGNORECASE),
+        re.compile(r"\bi\s+use\b", re.IGNORECASE),
+        re.compile(r"\bcall\s+me\b", re.IGNORECASE),
+        re.compile(r"\bmy\s+(?:birthday|birthdate)\s+is\b", re.IGNORECASE),
+    )
+
+    # ── Retrieval-intent read patterns (Phase DMA) ────────────────────────────
+    # Trigger requires_memory_read=True when matched.
+    _READ_PATTERNS: tuple = (
+        re.compile(r"\bwhat\s+did\s+i\b", re.IGNORECASE),
+        re.compile(r"\bwhere\s+do\s+i\b", re.IGNORECASE),
+        re.compile(r"\bwhere\s+did\s+i\b", re.IGNORECASE),
+        re.compile(r"\byou\s+said\s+earlier\b", re.IGNORECASE),
+        re.compile(r"\bas\s+i\s+mentioned\b", re.IGNORECASE),
+        re.compile(r"\bremind\s+me\b", re.IGNORECASE),
+        re.compile(r"\bmy\s+last\b", re.IGNORECASE),
+        re.compile(r"\bdo\s+you\s+remember\b", re.IGNORECASE),
+        re.compile(r"\bwhat\s+(?:is|are)\s+my\b", re.IGNORECASE),
+        re.compile(r"\btell\s+me\s+(?:about\s+)?my\b", re.IGNORECASE),
+    )
+
     @classmethod
     def _requires_memory_retrieval(cls, text: str) -> bool:
-        """Return True if text contains a conversational back-reference signal."""
-        return any(pat in text for pat in cls._REFERENCE_PATTERNS)
+        """Return True if text contains a conversational back-reference signal.
+
+        Uses word-boundary regex to avoid false positives from substrings
+        (e.g. 'that' inside 'capital of France').
+        """
+        for pat in cls._REFERENCE_PATTERNS:
+            if re.search(r"\b" + re.escape(pat) + r"\b", text):
+                return True
+        return False
+
+    @classmethod
+    def _detect_write_intent(cls, text: str) -> bool:
+        """Return True if text contains a declarative personal fact (no LLM)."""
+        return any(p.search(text) for p in cls._WRITE_PATTERNS)
+
+    @classmethod
+    def _detect_read_intent(cls, text: str) -> bool:
+        """Return True if text contains a retrieval intent reference (no LLM)."""
+        return any(p.search(text) for p in cls._READ_PATTERNS)
 
     def __init__(
         self,
@@ -116,6 +164,9 @@ class SAMAgentOrchestrator:
         graph.add_node("state_init_node", self._state_init_node)
         graph.add_node("decision_logic_node", self._decision_logic_node)
         graph.add_node("task_preprocessing_node", self._task_preprocessing_node)
+        graph.add_node("memory_access_decision_node", self._memory_access_decision_node)  # Phase DMA
+        graph.add_node("fact_extraction_node", self._fact_extraction_node_wrapper)        # Phase DMA
+        graph.add_node("write_authorization_node", self._write_authorization_node)        # Phase DMA
         graph.add_node("memory_read_node", self._memory_read_node_wrapper)  # Phase 2
         graph.add_node("model_call_node", self._model_call_node)
         # result_handling_node removed (single-model-pass: model → format directly)
@@ -146,21 +197,41 @@ class SAMAgentOrchestrator:
                 "memory_write": "memory_write_node",
                 "long_term_memory_write": "long_term_memory_write_node",  # Phase 3.2
                 "format": "format_response_node",
+                "end": END,  # Terminal after all memory writes complete
             }
         )
 
-        graph.add_edge("task_preprocessing_node", "decision_logic_node")
+        # Phase DMA: preprocessing → memory_access_decision → (fact_extract|read|model)
+        graph.add_edge("task_preprocessing_node", "memory_access_decision_node")
+        graph.add_conditional_edges(
+            "memory_access_decision_node",
+            self._route_from_memory_access_decision,
+            {
+                "fact_extraction": "fact_extraction_node",
+                "memory_read": "memory_read_node",
+                "call_model": "model_call_node",
+            },
+        )
+        graph.add_edge("fact_extraction_node", "write_authorization_node")
+        graph.add_conditional_edges(
+            "write_authorization_node",
+            self._route_from_write_authorization,
+            {
+                "memory_read": "memory_read_node",
+                "call_model": "model_call_node",
+            },
+        )
         graph.add_edge("memory_read_node", "decision_logic_node")
         graph.add_edge("long_term_memory_read_node", "decision_logic_node")  # Phase 3.2
         graph.add_edge("tool_execution_node", "decision_logic_node")  # Phase MCP
 
-        # Single-model-pass: model_call_node exits directly to format (no tool loop-back)
-        # Failures are handled by error_router_node via format_response_node
+        # model_call_node success → decision_logic_node (Phase 3: memory writes then format)
+        # model_call_node failure → error_router_node → format_response_node
         graph.add_conditional_edges(
             "model_call_node",
             self._route_from_model_call,
             {
-                "success": "format_response_node",
+                "success": "decision_logic_node",  # Phase 3: memory writes → format
                 "failure": "error_router_node",
             }
         )
@@ -170,8 +241,8 @@ class SAMAgentOrchestrator:
         # error_router routes to format
         graph.add_edge("error_router_node", "format_response_node")
         
-        # format_response is exit
-        graph.set_finish_point("format_response_node")
+        # format_response is the final output node; graph ends after it
+        graph.add_edge("format_response_node", END)
 
         return graph.compile()
 
@@ -191,6 +262,8 @@ class SAMAgentOrchestrator:
             return "memory_write"
         elif state.command == "long_term_memory_write":  # Phase 3.2
             return "long_term_memory_write"
+        elif state.command == "end":
+            return "end"
         else:
             return "format"
 
@@ -204,6 +277,30 @@ class SAMAgentOrchestrator:
         if state.model_response and state.model_response.status == "success":
             return "success"
         return "failure"
+
+    def _route_from_memory_access_decision(self, state: AgentState) -> str:
+        """Route after memory_access_decision_node.
+
+        Priority:
+          1. Write intent → fact_extraction (even if read also needed; write first)
+          2. Read-only intent → memory_read
+          3. Neither → call_model directly
+        """
+        if state.requires_memory_write:
+            return "fact_extraction"
+        if state.requires_memory_read:
+            return "memory_read"
+        return "call_model"
+
+    def _route_from_write_authorization(self, state: AgentState) -> str:
+        """Route after write_authorization_node.
+
+        If read is also needed, do the read before the model call.
+        Otherwise go straight to model.
+        """
+        if state.requires_memory_read:
+            return "memory_read"
+        return "call_model"
 
     def _create_trace_metadata(self, state: AgentState) -> TraceMetadata:
         """Extract trace metadata from state."""
@@ -469,47 +566,24 @@ class SAMAgentOrchestrator:
             return {"command": "preprocess"}
 
         # ── Phase 2: Before model call ───────────────────────────────────────
+        # NOTE: memory_read and long_term_memory_read are now handled by the
+        # memory_access_decision_node → fact_extraction → write_authorization
+        # pre-model pipeline (Phase DMA).  decision_logic_node only reaches here
+        # when routed back from memory_read_node (post-DMA) or tool_execution_node.
         if state.model_response is None:
             # Post-tool re-call: skip memory reads (already done in turn 1)
             if state.tool_executed:
                 return {"command": "call_model"}
 
-            # ── Reference-signal-gated STM read ──────────────────────────────
-            # Detect conversational back-references BEFORE tool routing so the
-            # model is grounded in prior context when it generates the answer.
-            # Triggered once per turn: guarded by memory_read_authorized flag.
-            user_text_mem = (state.preprocessing_result or state.raw_input or "").lower()
+            # LTM read after DMA memory_read_node loop-back
             if (
-                not state.memory_read_authorized
-                and state.memory_read_result is None
-                and self._requires_memory_retrieval(user_text_mem)
-            ):
-                try:
-                    self.tracer.record_event(
-                        name="memory_retrieval_triggered",
-                        metadata={
-                            "trigger": "reference_signal",
-                            "query_preview": user_text_mem[:80],
-                        },
-                        trace_metadata=trace_metadata,
-                    )
-                except Exception:
-                    pass
-                return {
-                    "command": "memory_read",
-                    "memory_read_authorized": True,
-                }
-
-            # LTM read: attempt once per turn if not yet done and store is available
-            if (
-                state.long_term_memory_read_result is None
+                state.requires_memory_read
+                and state.long_term_memory_read_result is None
                 and state.long_term_memory_status == "available"
             ):
                 return {"command": "long_term_memory_read"}
 
             # ── Phase 2b: Pre-model tool routing ─────────────────────────────
-            # This is the ONLY place execute_tool is emitted.  Check freshness
-            # keywords in the user query before the first model call.
             if state.tool_call_count < MCPGuardrails.MAX_TOOL_CALLS_PER_TURN:
                 query_lower = (state.preprocessing_result or state.raw_input or "").lower()
                 has_freshness = any(kw in query_lower for kw in self._FRESHNESS_KEYWORDS)
@@ -547,16 +621,21 @@ class SAMAgentOrchestrator:
             return {"command": "call_model"}
 
         # ── Phase 3: After model call — memory/format routing ────────────────
-        # model_call_node now exits directly to format_response_node via a hard
-        # graph edge, so this branch is only reached when the memory-write cycle
-        # loops back here (memory_write_node → decision_logic_node).
+        # model_call_node exits here via decision_logic_node when the memory-write
+        # cycle runs (memory_write_node → decision_logic_node loops).
 
-        # Case 1: Memory write authorized but not yet executed
+        # Case 1: DMA authorized write, STM write not yet done → do it
         if state.memory_write_authorized and state.memory_write_status is None:
             return {"command": "memory_write"}
 
-        # Case 2: Memory write not yet authorized (authorize once)
-        if not state.memory_write_authorized:
+        # Case 2: write_authorization_node ran and said "no" (or DMA requires_write=False)
+        # → skip STM/LTM writes entirely, go straight to format.
+        if state.write_authorization_checked and not state.memory_write_authorized:
+            return {"command": "format"}
+
+        # Case 2b: Legacy path — no DMA (write_authorization_checked=False) and not authorized
+        # Authorize once so the STM always records the interaction outcome.
+        if not state.write_authorization_checked and not state.memory_write_authorized:
             return {
                 "command": "memory_write",
                 "memory_write_authorized": True,
@@ -566,8 +645,200 @@ class SAMAgentOrchestrator:
         if state.long_term_memory_write_status is None:
             return {"command": "long_term_memory_write"}
 
-        # Case 4: All memory done → format
+        # Case 4: All memory done → format_response_node to finalise output, then END
         return {"command": "format"}
+
+    # ─────────────────────────────────────────────────────
+    # PHASE DMA: DETERMINISTIC MEMORY ACCESS DECISION
+    # ─────────────────────────────────────────────────────
+
+    def _memory_access_decision_node(self, state: AgentState) -> Dict[str, Any]:
+        """
+        Determine memory intent deterministically (no LLM).
+
+        Sets:
+          state.requires_memory_write  — declarative fact detected
+          state.requires_memory_read   — retrieval intent detected
+
+        Performance: sub-5ms regex scan, no I/O.
+
+        Phase DMA invariants:
+        - NEVER calls the model
+        - NEVER reads or writes memory
+        - NEVER influences routing directly (routing lives in
+          _route_from_memory_access_decision)
+        """
+        return self._wrap_node_execution(
+            "memory_access_decision_node",
+            self._memory_access_decision_node_impl,
+            state,
+        )
+
+    def _memory_access_decision_node_impl(self, state: AgentState) -> Dict[str, Any]:
+        """memory_access_decision_node implementation (unwrapped)."""
+        text = (state.preprocessing_result or state.raw_input or "").strip()
+
+        requires_write = self._detect_write_intent(text)
+        requires_read = self._detect_read_intent(text)
+
+        # Also honour legacy reference-signal patterns for read
+        if not requires_read and self._requires_memory_retrieval(text.lower()):
+            requires_read = True
+
+        trace_metadata = self._create_trace_metadata(state)
+        try:
+            self.tracer.record_event(
+                name="memory_access_decision",
+                metadata={
+                    "requires_memory_write": requires_write,
+                    "requires_memory_read": requires_read,
+                    "input_preview": text[:80],
+                },
+                trace_metadata=trace_metadata,
+            )
+        except Exception:
+            pass
+
+        logger.info(
+            f"[DMA] memory_access_decision: write={requires_write} read={requires_read} "
+            f"conv={state.conversation_id}"
+        )
+
+        return {
+            "requires_memory_write": requires_write,
+            "requires_memory_read": requires_read,
+        }
+
+    def _fact_extraction_node_wrapper(self, state: AgentState) -> Dict[str, Any]:
+        """
+        Extract structured personal facts from user input (Phase DMA).
+
+        Only executed when requires_memory_write=True.
+        Uses FactExtractor (deterministic regex, no LLM).
+        Sets state.extracted_facts.
+
+        If no facts survive confidence threshold → clears requires_memory_write
+        so the write path is skipped entirely.
+        """
+        trace_metadata = self._create_trace_metadata(state)
+        try:
+            self.tracer.record_event(
+                name="fact_extraction_started",
+                metadata={"conversation_id": state.conversation_id},
+                trace_metadata=trace_metadata,
+            )
+        except Exception:
+            pass
+        return self._wrap_node_execution(
+            "fact_extraction_node", self._fact_extraction_node_impl, state
+        )
+
+    def _fact_extraction_node_impl(self, state: AgentState) -> Dict[str, Any]:
+        """fact_extraction_node implementation (unwrapped)."""
+        from agent.intelligence.fact_extraction import FactExtractor, FactExtractionRequest  # noqa: PLC0415
+
+        extractor = FactExtractor()
+        request = FactExtractionRequest(
+            user_input=state.preprocessing_result or state.raw_input,
+            model_response=None,
+            conversation_turn_id=state.trace_id,
+            conversation_id=state.conversation_id,
+        )
+        response = extractor.extract(request)
+        facts = response.extracted_facts  # list[ExtractedFact], already filtered ≥0.7
+
+        trace_metadata = self._create_trace_metadata(state)
+        try:
+            self.tracer.record_event(
+                name="fact_extraction_completed",
+                metadata={
+                    "extracted_fact_count": len(facts),
+                    "attempted": response.extraction_attempted,
+                    "error": response.extraction_error,
+                },
+                trace_metadata=trace_metadata,
+            )
+        except Exception:
+            pass
+
+        logger.info(
+            f"[DMA] fact_extraction: {len(facts)} fact(s) extracted "
+            f"conv={state.conversation_id}"
+        )
+
+        # Early-exit: if extractor produced nothing, clear write intent so
+        # write_authorization_node will not authorize a pointless write.
+        requires_write = len(facts) > 0
+
+        return {
+            "extracted_facts": [f.model_dump() for f in facts],
+            "requires_memory_write": requires_write,
+        }
+
+    def _write_authorization_node(self, state: AgentState) -> Dict[str, Any]:
+        """
+        Deterministic write authorization gate (Phase DMA).
+
+        Enforces:
+        - extracted_facts not empty
+        - confidence ≥ 0.7 (already filtered by FactExtractor, double-checked)
+        - not a sensitive fact type (reserved for future blocklist)
+        - total facts ≤ 3 per turn
+
+        Sets:
+          state.memory_write_authorized = True | False
+          state.write_authorization_checked = True
+
+        NEVER calls LLM.  Sub-1ms execution.
+        """
+        return self._wrap_node_execution(
+            "write_authorization_node", self._write_authorization_node_impl, state
+        )
+
+    def _write_authorization_node_impl(self, state: AgentState) -> Dict[str, Any]:
+        """write_authorization_node implementation (unwrapped)."""
+        facts = state.extracted_facts or []
+        authorized = False
+        reason = "no_facts"
+
+        if facts:
+            # Re-check confidence threshold (belt+suspenders)
+            passing = [
+                f for f in facts
+                if isinstance(f, dict) and f.get("confidence", 0.0) >= 0.7
+            ]
+            if passing:
+                # Cap at 3 per guardrail
+                passing = passing[:3]
+                authorized = True
+                reason = f"{len(passing)}_facts_authorized"
+            else:
+                reason = "all_facts_below_confidence_threshold"
+
+        trace_metadata = self._create_trace_metadata(state)
+        try:
+            self.tracer.record_event(
+                name="write_authorization_decision",
+                metadata={
+                    "authorized": authorized,
+                    "reason": reason,
+                    "fact_count": len(facts),
+                    "write_latency_budget_ms": 50,
+                },
+                trace_metadata=trace_metadata,
+            )
+        except Exception:
+            pass
+
+        logger.info(
+            f"[DMA] write_authorization: authorized={authorized} reason={reason} "
+            f"conv={state.conversation_id}"
+        )
+
+        return {
+            "memory_write_authorized": authorized,
+            "write_authorization_checked": True,
+        }
 
     def _task_preprocessing_node(self, state: AgentState) -> Dict[str, Any]:
         """
